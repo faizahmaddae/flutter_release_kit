@@ -94,6 +94,13 @@ final class AppModel: ObservableObject {
     var readabilityStall: (@Sendable () -> Void)?
     private var selectionAfterRunPath: String?
     private var cancellationRequested = false
+    // What syncVersionFields() last put in sharedBuildName/androidBuildNumber/
+    // iosBuildNumber, so it can tell a field still following pubspec apart from one the
+    // user has since typed into — see syncVersionFields() for why that distinction, not
+    // emptiness, is what decides whether a reload may touch the field.
+    private var lastSeededBuildName: String?
+    private var lastSeededAndroidBuildNumber: String?
+    private var lastSeededIOSBuildNumber: String?
     private let clientFactory: (String) -> FRKClientProtocol
     private var client: FRKClientProtocol { clientFactory(cliPath) }
     // Streaming is not part of the injectable surface — see FRKClientProtocol — so
@@ -734,18 +741,46 @@ final class AppModel: ObservableObject {
             iosBuildName = ""
             androidBuildNumber = ""
             iosBuildNumber = ""
+            lastSeededBuildName = nil
+            lastSeededAndroidBuildNumber = nil
+            lastSeededIOSBuildNumber = nil
             return
         }
-        sharedBuildName = project.buildName ?? ""
-        // Only ever fills a split field that has nothing in it. A reload of the same
-        // project happens after every run, and re-seeding here would silently discard
-        // an iOS name the user typed deliberately.
+        // A reload of the SAME project happens after every run that project's
+        // Build/Validate/Doctor/Verify starts, not only after switching projects — and
+        // pubspec is never edited automatically, so most of those reloads see the exact
+        // value they saw last time. Blindly re-seeding here would silently throw away a
+        // number the user just typed, and may have already built with, the moment the
+        // next command finishes; Google Play then rejects the following upload as a
+        // duplicate of the number this just put back.
+        //
+        // The distinction that matters is not "is the field empty" but "does the field
+        // still hold what was last seeded here": that is true right after a fresh seed
+        // and stays true across reloads where nothing changed, but goes false the moment
+        // either the user types something else in or pubspec's own value moves out from
+        // under it — both cases where the field must not be touched again. A field that
+        // was never touched keeps following pubspec, so an external edit (a version bump
+        // made by hand, outside this app) still reaches it on the next reload.
+        let name = project.buildName ?? ""
+        if sharedBuildName.isEmpty || sharedBuildName == lastSeededBuildName {
+            sharedBuildName = name
+        }
+        lastSeededBuildName = name
+
         if splitVersionName, iosBuildName.isEmpty {
             iosBuildName = sharedBuildName
         }
+
         let seeded = project.buildNumber.map(String.init) ?? ""
-        androidBuildNumber = seeded
-        iosBuildNumber = seeded
+        if androidBuildNumber.isEmpty || androidBuildNumber == lastSeededAndroidBuildNumber {
+            androidBuildNumber = seeded
+        }
+        lastSeededAndroidBuildNumber = seeded
+
+        if iosBuildNumber.isEmpty || iosBuildNumber == lastSeededIOSBuildNumber {
+            iosBuildNumber = seeded
+        }
+        lastSeededIOSBuildNumber = seeded
     }
 
     /// A different project means a different release: the queued run and any leg
@@ -771,7 +806,13 @@ final class AppModel: ObservableObject {
         } else {
             splitVersionName = false
         }
+        // A different project means different numbers are correct here, so this is
+        // the one place all four fields are cleared before re-seeding — everywhere
+        // else, syncVersionFields() only fills a field that is already empty.
+        sharedBuildName = ""
         iosBuildName = ""
+        androidBuildNumber = ""
+        iosBuildNumber = ""
         syncVersionFields()
     }
 }

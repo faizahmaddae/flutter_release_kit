@@ -2590,6 +2590,50 @@ final class ReleaseKitAppTests: XCTestCase {
     }
 
     @MainActor
+    func testATypedBuildNumberSurvivesTheReloadThatFollowsBuildOrValidateWhenPubspecDidNotChange() async throws {
+        // The reported failure: raise the versionCode field, Build (which never touches
+        // pubspec — see CONTRIBUTING's "versions are never auto-incremented"), then
+        // Validate. reloadProjects() runs after Build settles, before Validate ever
+        // starts, and pubspec still says the old number because nothing edited it. If
+        // that reload put the old number back, Validate would run with it and Google
+        // Play would reject the upload as a duplicate of the number the user thought
+        // they had already moved past — exactly what was reported.
+        let fake = FakeFRKClient(projectsResponse: Self.projectsResponse([
+            Self.projectSummary(id: "maktab", name: "maktab", buildName: "2.0.0", buildNumber: 38, platforms: [.android, .ios]),
+        ]))
+        let model = AppModel(clientFactory: { _ in fake })
+        try await model.reloadProjects()
+        XCTAssertEqual(model.androidBuildNumber, "38")
+
+        model.androidBuildNumber = "39"
+        // Simulates the reload AppModel.start() runs once Build settles: same project,
+        // pubspec unchanged, so the fake's response is identical to the first reload.
+        try await model.reloadProjects()
+
+        XCTAssertEqual(
+            model.androidBuildNumber, "39",
+            "a same-project reload with an unchanged pubspec must not revert a number the user just typed"
+        )
+    }
+
+    @MainActor
+    func testATypedSharedBuildNameSurvivesTheSameReload() async throws {
+        // Same guarantee as the build-number test above, for the version-name field the
+        // report raised alongside versionCode.
+        let fake = FakeFRKClient(projectsResponse: Self.projectsResponse([
+            Self.projectSummary(id: "maktab", name: "maktab", buildName: "2.0.0", buildNumber: 38),
+        ]))
+        let model = AppModel(clientFactory: { _ in fake })
+        try await model.reloadProjects()
+        XCTAssertEqual(model.sharedBuildName, "2.0.0")
+
+        model.sharedBuildName = "2.1.0"
+        try await model.reloadProjects()
+
+        XCTAssertEqual(model.sharedBuildName, "2.1.0")
+    }
+
+    @MainActor
     func testEachPlatformsRequestCarriesItsOwnVersionPair() {
         let model = AppModel()
         model.sharedBuildName = "2.1.0"
