@@ -24,7 +24,18 @@ __pycache__/
 *.pyc
 
 # Native macOS desktop build output
-desktop/ReleaseKitApp/.build/
-desktop/ReleaseKitApp/dist/
+.build/
+dist/
+
+# Editor and toolchain state
+.swiftpm/
+xcuserdata/
+DerivedData/
+*.xcuserstate
+.idea/
+.vscode/
+.venv/
+venv/
+.ruff_cache/
 
 .DS_Store

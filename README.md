@@ -68,12 +68,16 @@ errors, use the [onboarding guide](docs/ONBOARDING.md).
 ## Requirements
 
 - A Flutter app with a real Android application ID and/or iOS bundle ID.
-- [fastlane](https://fastlane.tools/) for store releases.
+- Python 3.9 or newer (macOS ships 3.9 at `/usr/bin/python3`).
+- [fastlane](https://fastlane.tools/) 2.220.0 or newer for store releases.
 - Store listings and API credentials for the platforms being released.
 - macOS with Xcode for iOS builds and TestFlight uploads.
 
-The `frk` command uses only the Python standard library. `frk setup` reports any
-missing tool and gives the relevant installation command when available.
+The `frk` command uses only the Python standard library. The shared Fastfile
+declares `fastlane_version "2.220.0"`, and an older Fastlane stops while loading
+it. `frk setup` checks that Flutter and Fastlane are present, not which version
+is installed; it reports any missing tool and gives the relevant installation
+command when available.
 
 ## How it works
 
@@ -85,6 +89,10 @@ Each onboarded app receives small, non-secret files:
 | `fastlane/release_kit.yml` | Declares identifiers, platforms, tracks, and app-specific options |
 | `ios/ExportOptions.plist` | Pins App Store export to the app's deterministic provisioning profile |
 | `.gitignore` additions | Excludes generated artifacts and local credentials |
+
+The app Fastfile and the `.gitignore` rules come from the two files in
+`templates/`. `fastlane/release_kit.yml` and `ios/ExportOptions.plist` have no
+template: `frk` generates them from the identifiers detected for the app.
 
 For example, a generated dual-platform configuration has this shape (all
 values are illustrative):
@@ -114,7 +122,7 @@ flutter_release_kit/
 ├── bin/frk                  CLI for onboarding, checks, builds, and releases
 ├── desktop/ReleaseKitApp/   native SwiftUI control surface for macOS
 ├── fastlane/Fastfile        shared release lanes
-├── templates/               files generated for each app
+├── templates/               app Fastfile and .gitignore templates
 ├── tests/                   dependency-free CLI tests
 └── docs/ONBOARDING.md       setup and troubleshooting guide
 ```
@@ -170,7 +178,7 @@ frk release   Upload to Play testing and/or TestFlight
 frk list      Show explicitly managed projects
 frk forget    Remove only a registry entry
 frk status    Inspect toolkit and shared credential state
-frk signing   Import, link, or audit Android upload keys
+frk signing   Import, link, audit Android keys; set up iOS distribution signing
 ```
 
 Run `frk COMMAND --help` for command-specific options. Advanced users can also
@@ -180,9 +188,13 @@ run the imported Fastlane lanes directly.
 
 The optional SwiftUI app gives the same shared system a native project
 dashboard, guided onboarding, live logs, safe cancellation, build controls,
-Android testing-track uploads, and TestFlight uploads. It calls the installed
-`frk` executable through a versioned JSON protocol, so release logic remains in
-one place and CLI improvements do not need to be duplicated in the app.
+Android testing-track uploads, and TestFlight uploads. Its Screenshot Studio
+captures a running Android emulator/device or iOS Simulator, accepts existing
+images and clipboard content, adds a clean Android or iPhone frame, and exports
+a new high-resolution PNG. Source images remain untouched and no screenshot is
+uploaded automatically. It calls the installed `frk` executable through a
+versioned JSON protocol, so release logic remains in one place and CLI
+improvements do not need to be duplicated in the app.
 
 ```bash
 cd desktop/ReleaseKitApp
@@ -215,3 +227,10 @@ as a configuration option with a backward-compatible default.
 
 Do not add release lanes to generated app Fastfiles; doing so recreates the
 duplication this toolkit is designed to remove.
+
+Contributors should read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a
+pull request.
+
+## License
+
+Released under the MIT License. See [LICENSE](LICENSE).

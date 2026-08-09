@@ -1,0 +1,6 @@
+# Lint settings for CI only. Ruff is a development tool and is never needed to
+# run the CLI: bin/frk imports the Python standard library only at runtime.
+target-version = "py39"
+
+[lint]
+select = ["F"]

@@ -6,7 +6,9 @@ single source of truth, while the app speaks the stable, versioned FRK protocol.
 
 ## Build and run
 
-Requirements: macOS 14 or newer and Xcode 15 or newer.
+Requirements: macOS 14 or newer to run the app, and Xcode 16 or newer to build
+it. `Package.swift` declares `swift-tools-version: 6.0`, which earlier toolchains
+cannot read, so `swift test` fails immediately on Xcode 15.
 
 ```bash
 cd desktop/ReleaseKitApp
@@ -49,6 +51,10 @@ frk setup
 - Automatic iOS repair has a separate confirmation because it can create or
   refresh Apple Developer certificates and provisioning profiles. It never
   uploads a build.
+- Screenshot Studio is local-only. It can capture a selected Android device or
+  iOS Simulator, import an existing image, add an Android/iPhone frame, and
+  export a new PNG. The original image is never overwritten and nothing is
+  uploaded to a store.
 
 The locally built app is ad-hoc signed. Before public distribution, use a
 Developer ID certificate, hardened runtime, notarization, and a release-specific
