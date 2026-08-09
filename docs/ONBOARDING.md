@@ -28,6 +28,11 @@ creates a commented credential template, installs the `frk` command in
 `~/.local/bin`, and checks Flutter and Fastlane. Existing commands, credentials,
 and registered projects are preserved.
 
+The `frk` command itself needs Python 3.9 or newer, which macOS provides at
+`/usr/bin/python3`. The shared Fastfile requires fastlane 2.220.0 or newer and
+an older Fastlane stops while loading it. Setup only checks that Fastlane is
+installed, so confirm the version separately with `fastlane --version`.
+
 Follow any PATH or missing-tool instruction printed by setup, then confirm:
 
 ```bash
@@ -63,6 +68,24 @@ ASC_ISSUER_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 ASC_KEY_FILEPATH=asc/AuthKey_XXXXXXXXXX.p8
 SUPPLY_JSON_KEY=play/service-account.json
 ```
+
+`ASC_KEY_CONTENT` replaces `ASC_KEY_FILEPATH` on machines that keep the key out
+of the filesystem. Set it to the full PEM text of the `.p8`, including the
+`BEGIN PRIVATE KEY` and `END PRIVATE KEY` lines. Two limits apply:
+
+- `fastlane ios validate` still needs a `.p8` on disk. It stops with an explicit
+  error when only `ASC_KEY_CONTENT` is set, because `altool` reads the key from
+  a directory rather than from the environment. Releases and TestFlight uploads
+  are unaffected.
+- Fastlane also accepts a bare base64 value, but FRK's own credential check
+  recognizes only the PEM form. A base64 value therefore releases correctly
+  while the macOS app and `frk api credentials` report the App Store Connect key
+  as malformed.
+
+`frk status` counts `AuthKey_*.p8` files in `~/.flutter-release/asc/` and does
+not read `ASC_KEY_CONTENT` in either form. It therefore warns that no App Store
+Connect key is present whenever the key is supplied inline, and also when a key
+file on disk was renamed away from the `AuthKey_` prefix.
 
 The macOS app provides the safer guided alternative: open **Settings → Manage
 Connections** and choose the JSON or `.p8` source. FRK validates it, preserves
@@ -195,8 +218,14 @@ Skip this section for Android-only apps.
 Run the account-level setup once for the Apple team:
 
 ```bash
-fastlane ios setup_signing
+frk signing ios-setup example_app
 ```
+
+The command checks `ios/ExportOptions.plist` against the app's bundle ID, team
+ID, profile name, and export settings. A file that no longer matches is backed
+up into `~/.flutter-release/signing/ios/<team-id>/backups/` and regenerated. It
+then runs the shared `fastlane ios setup_signing` lane and keeps the machine
+awake while the lane talks to Apple.
 
 The lane creates or reuses an Apple Distribution certificate, creates an App
 Store provisioning profile for the app, and imports the identity into the macOS
@@ -207,6 +236,30 @@ The profile name is deterministic (`<bundle-id> AppStore`) and the generated
 `ios/ExportOptions.plist` pins exports to it. This matters on machines without
 an Apple ID signed into Xcode: automatic export can otherwise select an older
 profile whose certificate is no longer installed.
+
+The lane also switches `ios/Runner.xcodeproj`'s **Release** configuration from
+Xcode's default "Automatically manage signing" to manual signing with the
+profile it just created. This closes a real gap: a fresh Flutter project
+always starts on automatic signing, which resolves to whatever identity Xcode
+picks for the current run destination — usually a development certificate —
+and an archive build signs with that identity regardless of what
+`ExportOptions.plist` says, since the plist only governs re-export after the
+archive already exists. Without this step, `frk doctor` and this command can
+both report signing as ready while an actual archive still fails or is signed
+with the wrong identity. Debug and Profile stay untouched, so `flutter run`
+still works normally. The previous `project.pbxproj` is backed up next to the
+`ExportOptions.plist` backups before it is changed.
+
+Advanced users can run the lane directly from the project directory:
+
+```bash
+fastlane ios setup_signing
+```
+
+The lane on its own never rewrites `ios/ExportOptions.plist`. Fastlane writes
+that file only when it is missing, and only during a build, so an export file
+left over from a different bundle ID or team keeps pinning the wrong profile
+until `frk signing ios-setup` replaces it.
 
 `frk doctor` also requires the app-specific profile in this central directory,
 so a missing setup is reported before Xcode spends time creating an archive.
@@ -299,7 +352,8 @@ the configured value and query the store with `fastlane ios builds`.
 
 **`No Apple Distribution signing identity`**
 
-Run `fastlane ios setup_signing`.
+Run `frk signing ios-setup example_app`. That also repairs an
+`ios/ExportOptions.plist` that no longer matches the app.
 
 **The version train is closed or must be higher than the approved version**
 

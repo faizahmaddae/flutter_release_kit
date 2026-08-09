@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct ActivityPanel: View {
@@ -14,6 +15,16 @@ struct ActivityPanel: View {
                         .foregroundStyle(statusColor)
                 }
                 Spacer()
+
+                if !model.activity.isEmpty {
+                    Button {
+                        copyActivityToPasteboard()
+                    } label: {
+                        Label("Copy", systemImage: "doc.on.doc")
+                    }
+                    .controlSize(.small)
+                    .help("Copy the full activity log to the clipboard, including any stack trace.")
+                }
 
                 if model.isRunning {
                     ProgressView()
@@ -35,6 +46,11 @@ struct ActivityPanel: View {
 
             Divider()
 
+            if let errorLine = model.lastActivityErrorLine {
+                errorBanner(errorLine)
+                Divider()
+            }
+
             if model.activity.isEmpty {
                 ContentUnavailableView {
                     Label("Ready", systemImage: "terminal")
@@ -46,6 +62,41 @@ struct ActivityPanel: View {
             }
         }
         .background(Color(nsColor: .textBackgroundColor).opacity(0.45))
+    }
+
+    /// fastlane's own message, pulled out of the scrolling log so the auto-scroll that
+    /// follows a live-streaming stack trace cannot carry it out of view. Stays up until
+    /// the next run starts or the log is cleared, so there's no race with the log
+    /// settling.
+    private func errorBanner(_ line: String) -> some View {
+        HStack(alignment: .top, spacing: 7) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.red)
+                .frame(width: 13)
+            Text(Self.displayText(for: line))
+                .font(.system(.caption, design: .monospaced))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(Color.red.opacity(0.12))
+    }
+
+    /// fastlane's "[!] " marker sits at the start of the line for a plain `user_error!`
+    /// but mid-line for an unhandled crash, glued onto Ruby's own `path:line:in
+    /// 'method': ` prefix — the marker's position is the only reliable signal, so this
+    /// keeps everything from the marker onward and drops whatever came before it rather
+    /// than guessing at a fixed prefix shape.
+    static func displayText(for line: String) -> String {
+        guard let marker = line.range(of: "[!] ") else { return line }
+        return String(line[marker.upperBound...])
+    }
+
+    private func copyActivityToPasteboard() {
+        let text = model.activity.map(\.message).joined(separator: "\n")
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
     }
 
     private var statusText: String {

@@ -108,6 +108,12 @@ struct RootView: View {
             StoreConnectionsView(presentation: .firstRun)
                 .environmentObject(model)
         }
+        .sheet(isPresented: $model.showScreenshotStudio) {
+            if let project = model.selectedProject {
+                ScreenshotStudioView(project: project)
+                    .environmentObject(model)
+            }
+        }
         .alert("Flutter Release Kit", isPresented: errorPresented) {
             Button("OK", role: .cancel) {
                 model.errorMessage = nil

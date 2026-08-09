@@ -150,14 +150,14 @@ struct SetupAssistantView: View {
 
                 SetupCheckRow(
                     title: "key.properties",
-                    detail: androidPropertiesDetail(status),
+                    detail: status.propertiesDetail,
                     state: status.projectPropertiesExists && status.propertiesComplete ? .ready : .error
                 )
 
                 SetupCheckRow(
                     title: "Upload keystore",
-                    detail: androidKeystoreDetail(status),
-                    state: androidKeystoreState(status)
+                    detail: status.keystoreDetail,
+                    state: status.keystoreState
                 )
 
                 if let gradleReady = status.gradleConfigured {
@@ -170,13 +170,13 @@ struct SetupAssistantView: View {
 
                 SetupCheckRow(
                     title: "Git safety",
-                    detail: androidGitDetail(status),
+                    detail: status.gitDetail,
                     state: (status.gitSafe ?? !status.gitTracked) ? .ready : .error
                 )
 
                 SetupCheckRow(
                     title: "Private vault",
-                    detail: androidVaultDetail(status),
+                    detail: status.vaultDetail,
                     state: status.vaultReady && status.projectLinked ? .ready : .warning
                 )
 
@@ -317,8 +317,8 @@ struct SetupAssistantView: View {
                 )
                 SetupCheckRow(
                     title: "Provisioning profile",
-                    detail: iosProfileDetail(status),
-                    state: iosProfileState(status)
+                    detail: status.profileDetail,
+                    state: status.profileState
                 )
                 if let exportReady = status.exportOptionsReady {
                     SetupCheckRow(
@@ -356,7 +356,7 @@ struct SetupAssistantView: View {
                             Label("Repair Automatically…", systemImage: "wand.and.stars")
                         }
                         .buttonStyle(.borderedProminent)
-                        .help("After confirmation, repair ExportOptions, reuse or create Apple Distribution signing material, and refresh this app's provisioning profile. No build is uploaded, but Apple Developer account state may change.\nCommand: \(FRKRunRequest(action: .iosSetupSigning, project: project.id).commandPreview)")
+                        .help("After confirmation, repair ExportOptions, reuse or create Apple Distribution signing material, refresh this app's provisioning profile, and switch the Xcode project's Release configuration to sign with it. No build is uploaded, but Apple Developer account state and the Xcode project file may change; the previous project file is backed up first.\nCommand: \(FRKRunRequest(action: .iosSetupSigning, project: project.id).commandPreview)")
 
                         if status.workspaceExists {
                             Button("Open in Xcode") {
@@ -365,7 +365,7 @@ struct SetupAssistantView: View {
                             .help("Open the iOS workspace to inspect or repair signing manually. No project files are changed by opening Xcode.")
                         }
                     }
-                    Text("Automatic repair restores app-specific export settings and refreshes missing signing material. It never uploads a build.")
+                    Text("Automatic repair restores app-specific export settings, refreshes missing signing material, and points Xcode's Release configuration at it — so Xcode's own \"Automatically manage signing\" no longer disagrees with what this tool builds. It never uploads a build.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } else {
@@ -402,78 +402,6 @@ struct SetupAssistantView: View {
         }
     }
 
-    private func androidPropertiesDetail(_ status: AndroidSetupStatus) -> String {
-        if !status.projectPropertiesExists {
-            return "Missing at \(status.projectPropertiesPath)"
-        }
-        if !status.propertiesComplete {
-            let fields = status.missingPropertiesFields?.joined(separator: ", ") ?? "required signing fields"
-            return "Missing values: \(fields)"
-        }
-        return "Found and complete · \(status.projectPropertiesPath)"
-    }
-
-    private func androidKeystoreDetail(_ status: AndroidSetupStatus) -> String {
-        if !status.propertiesComplete {
-            return "Waiting for a complete key.properties"
-        }
-        if !status.keystoreExists {
-            return "File not found · \(status.referencedKeystorePath ?? "storeFile is not set")"
-        }
-        var detail = status.keystoreValidationDetail ?? "Keystore file exists"
-        if let fingerprint = status.certificateSHA256 {
-            detail += " · SHA-256 \(fingerprint)"
-        }
-        return detail
-    }
-
-    private func androidKeystoreState(_ status: AndroidSetupStatus) -> SetupCheckState {
-        guard status.propertiesComplete, status.keystoreExists else { return .error }
-        switch status.keystoreValidationStatus {
-        case "valid": return .ready
-        case "partial": return .warning
-        default: return .error
-        }
-    }
-
-    private func androidGitDetail(_ status: AndroidSetupStatus) -> String {
-        var tracked: [String] = []
-        if status.gitTracked { tracked.append("key.properties") }
-        if status.keystoreGitTracked == true { tracked.append("keystore") }
-        if !tracked.isEmpty {
-            return "Tracked secret: \(tracked.joined(separator: " and "))"
-        }
-        var unignored: [String] = []
-        if status.propertiesGitIgnored == false { unignored.append("key.properties") }
-        if status.keystoreGitIgnored == false { unignored.append("keystore") }
-        if !unignored.isEmpty {
-            return "Missing .gitignore protection: \(unignored.joined(separator: " and "))"
-        }
-        return "Signing secrets are ignored and not tracked by Git"
-    }
-
-    private func androidVaultDetail(_ status: AndroidSetupStatus) -> String {
-        if status.vaultReady && status.projectLinked {
-            return "Protected central copy is linked · \(status.vaultPath)"
-        }
-        if status.vaultReady {
-            return "Protected copy exists; link this project to use it"
-        }
-        return "Optional but recommended: protect one managed copy outside the repository"
-    }
-
-    private func iosProfileDetail(_ status: IOSSetupStatus) -> String {
-        if status.profileReady && status.profileCertificateMatchesIdentity == false {
-            return "The profile is valid but does not include a distribution identity available on this Mac"
-        }
-        return status.profileValidationDetail
-            ?? (status.profileReady ? status.profilePath : "The app-specific App Store profile is missing")
-    }
-
-    private func iosProfileState(_ status: IOSSetupStatus) -> SetupCheckState {
-        status.profileReady && status.profileCertificateMatchesIdentity != false ? .ready : .error
-    }
-
     private var signingImportRequest: FRKRunRequest {
         FRKRunRequest(
             action: .signingImport,
@@ -502,51 +430,6 @@ struct SetupAssistantView: View {
 
     private func openPath(_ value: String) {
         NSWorkspace.shared.open(URL(fileURLWithPath: value))
-    }
-}
-
-private enum SetupCheckState {
-    case ready
-    case warning
-    case error
-}
-
-private struct SetupCheckRow: View {
-    let title: String
-    let detail: String
-    let state: SetupCheckState
-
-    private var icon: String {
-        switch state {
-        case .ready: "checkmark.circle.fill"
-        case .warning: "exclamationmark.circle.fill"
-        case .error: "xmark.circle.fill"
-        }
-    }
-
-    private var color: Color {
-        switch state {
-        case .ready: .frkSuccess
-        case .warning: .orange
-        case .error: .red
-        }
-    }
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: icon)
-                .foregroundStyle(color)
-                .padding(.top, 2)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.callout.weight(.medium))
-                Text(detail)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-            }
-            Spacer(minLength: 0)
-        }
     }
 }
 

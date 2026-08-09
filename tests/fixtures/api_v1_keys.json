@@ -1,0 +1,199 @@
+{
+  "note": "Golden key names for the frk machine API (protocol v1). Key names only, never values: values would embed machine-specific paths and could leak private data. Each record maps a dotted nesting path ('.' is the record root) to its sorted key set; a '[]' suffix is the object inside a list at that path. Regenerate by running tests/test_api_contract.py's builders.",
+  "protocolVersion": 1,
+  "records": {
+    "capabilities_document": {
+      ".": [
+        "capabilities",
+        "cliVersion",
+        "maximumDesktopProtocol",
+        "minimumDesktopProtocol",
+        "protocolVersion"
+      ],
+      "capabilities": [
+        "actions",
+        "credentialManagement",
+        "platforms",
+        "productionRelease",
+        "projectDiscovery",
+        "streamingEvents"
+      ]
+    },
+    "credential_status_record": {
+      ".": [
+        "appStoreConnect",
+        "configuredAny",
+        "googlePlay",
+        "vaultPath"
+      ],
+      "googlePlay": [
+        "clientEmail",
+        "configured",
+        "detail",
+        "keyPath",
+        "projectId",
+        "validationStatus"
+      ],
+      "appStoreConnect": [
+        "configured",
+        "detail",
+        "issuerId",
+        "keyId",
+        "keyPath",
+        "validationStatus"
+      ]
+    },
+    "project_api_record": {
+      ".": [
+        "addedAt",
+        "android",
+        "artifacts",
+        "buildName",
+        "buildNumber",
+        "exists",
+        "id",
+        "ios",
+        "name",
+        "onboarded",
+        "path",
+        "platforms",
+        "state",
+        "version"
+      ],
+      "android": [
+        "packageId",
+        "signingReady",
+        "track"
+      ],
+      "ios": [
+        "bundleId",
+        "distributionIdentityReady",
+        "profilePath",
+        "profileReady",
+        "signingReady",
+        "teamId"
+      ],
+      "artifacts": [
+        "androidAab",
+        "iosIpa"
+      ],
+      "artifacts.androidAab": [
+        "modifiedAt",
+        "path",
+        "sizeBytes"
+      ],
+      "artifacts.iosIpa": [
+        "modifiedAt",
+        "path",
+        "sizeBytes"
+      ]
+    },
+    "setup_status_record": {
+      ".": [
+        "android",
+        "ios",
+        "projectId"
+      ],
+      "android": [
+        "certificateSHA256",
+        "configured",
+        "gitSafe",
+        "gitTracked",
+        "gradleConfigurationDetail",
+        "gradleConfigurationPath",
+        "gradleConfigured",
+        "keystoreExists",
+        "keystoreGitIgnored",
+        "keystoreGitTracked",
+        "keystoreValidationDetail",
+        "keystoreValidationStatus",
+        "missingPropertiesFields",
+        "packageId",
+        "projectLinked",
+        "projectPropertiesExists",
+        "projectPropertiesPath",
+        "propertiesComplete",
+        "propertiesGitIgnored",
+        "referencedKeystorePath",
+        "signingReady",
+        "vaultPath",
+        "vaultReady"
+      ],
+      "ios": [
+        "ascCredentialsReady",
+        "bundleId",
+        "configured",
+        "distributionIdentityDetail",
+        "distributionIdentityReady",
+        "exportOptionsDetail",
+        "exportOptionsPath",
+        "exportOptionsReady",
+        "profileCertificateMatchesIdentity",
+        "profileExpiresAt",
+        "profilePath",
+        "profileReady",
+        "profileValidationDetail",
+        "profileValidationStatus",
+        "projectIdentityDetail",
+        "projectIdentityReady",
+        "signingReady",
+        "teamId",
+        "workspaceExists",
+        "workspacePath"
+      ]
+    },
+    "store_versions_document": {
+      ".": [
+        "android",
+        "checkedAt",
+        "cliVersion",
+        "ios",
+        "project",
+        "protocolVersion"
+      ],
+      "android": [
+        "detail",
+        "latestVersionCode",
+        "latestVersionName",
+        "status",
+        "track",
+        "tracks"
+      ],
+      "android.tracks[]": [
+        "track",
+        "versionCode",
+        "versionName"
+      ],
+      "ios": [
+        "builds",
+        "detail",
+        "latestAppStoreVersion",
+        "status"
+      ],
+      "ios.builds[]": [
+        "build",
+        "state",
+        "version"
+      ]
+    },
+    "build_args_document": {
+      ".": [
+        "android",
+        "cliVersion",
+        "ios",
+        "protocolVersion",
+        "shared"
+      ],
+      "android": [
+        "configured",
+        "effective",
+        "own"
+      ],
+      "ios": [
+        "configured",
+        "effective",
+        "own"
+      ]
+    }
+  }
+}

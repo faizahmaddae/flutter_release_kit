@@ -34,14 +34,121 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 KIT_ROOT = Path(__file__).resolve().parent.parent
+# The shipped entry point, deliberately named rather than `Path(__file__)`: the
+# machine API re-executes the CLI as a subprocess and must reach the script this
+# kit ships, not whatever file happens to be running. The supported install is a
+# symlink named `frk` resolving here, so the two agree; a copy or rename under a
+# different basename already loses TEMPLATES and every other KIT_ROOT-relative
+# path, so re-executing the shipped script is the only sane reading anyway.
+CLI_ENTRYPOINT = KIT_ROOT / "bin" / "frk"
 TEMPLATES = KIT_ROOT / "templates"
-VERSION = "0.4.0"
+VERSION = "0.8.0"
 API_PROTOCOL_VERSION = 1
-CREDENTIALS_DIR = Path(os.environ.get("FLUTTER_RELEASE_HOME", "~/.flutter-release")).expanduser()
+# The one action list for `frk api run`. The `api run` argparse choices, the
+# `capabilities` document and the `api_action_command` dispatch all used to
+# carry their own copy and had drifted apart; a client that read an action out
+# of `capabilities` and could not pass it to `api run` got an argparse usage
+# block on stderr instead of a JSON event. Order is wire-visible (it is the
+# `capabilities.actions` array and the `--help` choice list): append only,
+# never sort.
+API_RUN_ACTIONS = (
+    "onboard", "doctor", "verify", "build", "validate",
+    "release", "signing-audit", "signing-import", "signing-link",
+    "ios-setup-signing", "status", "forget",
+)
+# The sibling list: `api` subcommands that answer with one document instead of
+# a JSON Lines stream. `credentials` and `configure-credentials` used to be
+# named inside `capabilities.actions`, where `api run` rejected them with an
+# argparse usage block on stderr — advertised but not accepted. They are
+# document commands, so they live here instead, and a test pins this tuple to
+# the registered `api` subparsers minus `run` so the two cannot drift apart
+# again. It is not emitted in the `capabilities` document: that key set is
+# frozen at v1 by tests/fixtures/api_v1_keys.json, so the document surface is
+# discovered from `frk api --help` until the protocol moves. Order is
+# wire-visible once it is: append only, never sort.
+API_DOCUMENT_COMMANDS = (
+    "capabilities", "projects", "project", "setup",
+    "credentials", "configure-credentials", "store-versions",
+    "build-args", "set-build-args",
+)
+# Exit code for "the CLI itself failed", kept distinct from the codes a child
+# release command can return so a client can tell the two apart.
+API_INTERNAL_EXIT = 70
 CONFIG_NAME = "fastlane/release_kit.yml"
+# Wall-clock ceiling for the Git exposure checks. Deliberately the generous one:
+# those answers decide whether a signing secret is sitting in a repository, and a
+# premature "not tracked" or "not ignored" silently weakens that guard — worse
+# than waiting out a cold index or a slow network filesystem.
+GIT_TIMEOUT_SECONDS = 30
+# Wall-clock ceiling for the macOS keychain lookup. A wedged `security` must not
+# be reported as "this machine holds no distribution certificate": that sentence
+# sends the user off to mint a duplicate one, which is expensive and hard to undo.
+KEYCHAIN_TIMEOUT_SECONDS = 20
+# Wall-clock ceiling for `fastlane store_versions`. Deliberately far above the
+# honest worst case rather than near it: the lane budgets 60s per store and
+# queries two, so two minutes of waiting is a slow-but-working answer, and ruby,
+# bundler and fastlane's own start-up sit in front of that. A ceiling near the
+# store budget would convert a slow store into "could not check", which is the
+# exact confusion this command exists to remove.
+#
+# It is a TOTAL deadline, not an idle timer: `capture_fastlane` hands it to
+# `communicate(timeout=...)`, which counts wall-clock seconds from spawn and
+# does not care whether the child is chattering or wedged. A run making steady
+# progress for 301 seconds is killed exactly like a hung one, so the sentence
+# the user gets must say "did not finish", never "made no progress". This is
+# the backstop, not a query budget — the per-store budget belongs to the lane,
+# which is the side that can attribute a timeout to one store and still report
+# the other.
+STORE_VERSIONS_TIMEOUT_SECONDS = 300
+# The lane prints exactly one of these lines; everything else it writes is
+# fastlane chatter that must never reach the document. Kept in sync with
+# `fastlane/Fastfile`; the trailing `:1` is the report's own version.
+STORE_VERSIONS_MARKER = "<<<FRK:STORE_VERSIONS:1>>>"
+# Fail closed: a status this CLI does not recognise is reported as "unavailable",
+# never as "ok" and never echoed through.
+STORE_VERSIONS_STATUSES = ("ok", "unconfigured", "no_credentials", "unavailable")
+# Belt and braces over the lane's own redaction. Every string that survives into
+# the document has already been shaped by one of these patterns or dropped, so a
+# lane that regressed and echoed a store error verbatim still cannot put a key
+# path, an issuer id or a token into a document that gets logged.
+STORE_VERSIONS_REDACTIONS = (
+    # Anchored on the BEGIN header alone and greedy to the end of the string.
+    # A BEGIN...END pair was unmatchable here: `store_versions_text` keeps only
+    # the first line before redacting, so the END marker is never in the text
+    # this sees, and the header plus whatever key bytes shared its line went
+    # through untouched.
+    re.compile(r"-----BEGIN[\s\S]*"),
+    re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
+    re.compile(r"\b[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\b"),
+    re.compile(r"(?:~|/)[^\s\"']*/[^\s\"']*"),
+    # Key ids and team ids are ten characters of [A-Z0-9]. The digit lookahead
+    # keeps the pattern off ordinary prose: TestFlight build states such as
+    # PROCESSING are also ten uppercase characters, and redacting one of those
+    # would corrupt a sentence the Fastfile wrote by hand.
+    re.compile(r"\b(?=[A-Z0-9]{10}\b)(?=[A-Z]*[0-9])[A-Z0-9]{10}\b"),
+    re.compile(r"\b[A-Za-z0-9+/_-]{24,}={0,2}"),
+)
+# Shapes for the fields that are not free text. A value that does not match is
+# reported as null rather than passed through: the document can then only carry
+# a version, a track, a state or nothing, whatever the lane sends.
+STORE_VERSIONS_VERSION = re.compile(r"\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.\-]+)?")
+# Play's built-in track ids are lowercase words (`internal`, `beta`), but a
+# closed-testing track id is whatever the user typed into the Console — "QA",
+# "Closed Beta" — and form-factor tracks carry a `wear:` / `automotive:`
+# prefix. A lowercase-only shape dropped those entries silently, taking a real
+# version code out of the list while the status still read "ok". Widened to the
+# characters a Console track name can hold, and no further: `/`, `@`, quotes
+# and control characters stay out, so a path, an email or a token still cannot
+# arrive dressed as a track id. Length is capped by `store_versions_token`.
+STORE_VERSIONS_TRACK = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _.:\-]*")
+STORE_VERSIONS_STATE = re.compile(r"[A-Z][A-Z0-9_]*")
+STORE_VERSIONS_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z")
+# Play caps a version code at 2100000000; a build number shares the ceiling.
+STORE_VERSIONS_MAX_NUMBER = 2_100_000_000
+STORE_VERSIONS_MAX_TRACKS = 16
+STORE_VERSIONS_MAX_BUILDS = 10
+STORE_VERSIONS_MAX_DETAIL = 400
 IMPORT_MARKER = "import kit_fastfile"
-REGISTRY_PATH = CREDENTIALS_DIR / "projects.json"
-SIGNING_DIR = CREDENTIALS_DIR / "signing"
 REGISTRY_VERSION = 1
 ANDROID_SIGNING_KEYS = ("storeFile", "storePassword", "keyAlias", "keyPassword")
 
@@ -84,6 +191,25 @@ def real_ios_identity(bundle_id: str | None, team_id: str | None) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# vault location
+# --------------------------------------------------------------------------- #
+# Every path below the private vault is derived here and nowhere else. These are
+# functions, not constants, so FLUTTER_RELEASE_HOME is read per call: a test (or
+# a future module split) redirects the whole vault by setting the variable, and
+# no hand-maintained list of derived constants can fall out of date.
+def credentials_dir() -> Path:
+    return Path(os.environ.get("FLUTTER_RELEASE_HOME", "~/.flutter-release")).expanduser()
+
+
+def registry_path() -> Path:
+    return credentials_dir() / "projects.json"
+
+
+def signing_dir() -> Path:
+    return credentials_dir() / "signing"
+
+
+# --------------------------------------------------------------------------- #
 # output helpers
 # --------------------------------------------------------------------------- #
 def _c(code: str, text: str) -> str:
@@ -95,6 +221,24 @@ def warn(m):  print(f"  {_c('33', 'warn')}  {m}")
 def fail(m):  print(f"  {_c('31', 'FAIL')}  {m}")
 def info(m):  print(f"        {m}")
 def head(m):  print(f"\n{_c('1', m)}")
+
+
+def configure_stdout_encoding() -> None:
+    """Pin stdout to UTF-8 so the bytes this CLI writes do not follow the locale.
+
+    Every file this script reads and writes names UTF-8 explicitly; stdout is the
+    remaining locale-dependent surface, and the machine API's JSON Lines stream
+    has to be one defined encoding whatever LC_ALL says. Guarded rather than
+    unconditional: a caller that has already replaced sys.stdout with a plain
+    text buffer has nothing to reconfigure, and must not fail because of it.
+    """
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if reconfigure is None:
+        return
+    try:
+        reconfigure(encoding="utf-8")
+    except (OSError, ValueError):
+        pass
 
 
 def die(msg: str, code: int = 1):
@@ -110,41 +254,107 @@ def ensure_private_dir(path: Path) -> None:
     path.chmod(0o700)
 
 
+# One upgrade step per entry, keyed by the version it reads. Each value takes a
+# registry document at that version and returns it at version + 1, so a format
+# change is a new entry rather than another branch inside load_registry. Empty
+# today: version 1 is the only format that has ever existed on disk.
+REGISTRY_MIGRATIONS = {}
+
+
+def migrate_registry(data: dict, registry: Path) -> dict:
+    """Bring a registry document up to REGISTRY_VERSION, or die explaining why not."""
+    version = data.get("version", REGISTRY_VERSION)
+    # Equality is tested before the type, not after: JSON `1.0` and `true` both
+    # compare equal to 1 and have always loaded, and an isinstance gate in front
+    # would start rejecting them. Only a version that is not already current has
+    # to be an int, because only that one gets ordered and walked.
+    if version == REGISTRY_VERSION:
+        return data
+    if not isinstance(version, int):
+        die(f"unsupported project registry version in {registry}")
+    # Every refusal below prints the same sentence on purpose: a newer format,
+    # a non-int version and a gap in the chain are one failure to the user, and
+    # the wording is part of the CLI's contract. Do not append a reason here.
+    if version > REGISTRY_VERSION:
+        die(f"unsupported project registry version in {registry}")
+    while version < REGISTRY_VERSION:
+        migrate = REGISTRY_MIGRATIONS.get(version)
+        if migrate is None:
+            die(f"unsupported project registry version in {registry}")
+        data = migrate(data)
+        version += 1
+    return data
+
+
 def load_registry() -> dict:
-    if not REGISTRY_PATH.is_file():
+    registry = registry_path()
+    if not registry.is_file():
         return {"version": REGISTRY_VERSION, "projects": []}
     try:
-        data = json.loads(REGISTRY_PATH.read_text())
+        data = json.loads(registry.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        die(f"could not read registry {REGISTRY_PATH}: {exc}")
+        die(f"could not read registry {registry}: {exc}")
     if not isinstance(data, dict) or not isinstance(data.get("projects"), list):
-        die(f"invalid project registry: {REGISTRY_PATH}")
-    if data.get("version", REGISTRY_VERSION) != REGISTRY_VERSION:
-        die(f"unsupported project registry version in {REGISTRY_PATH}")
+        die(f"invalid project registry: {registry}")
+    data = migrate_registry(data, registry)
     if any(not isinstance(project, dict) or not project.get("path") for project in data["projects"]):
-        die(f"invalid project entry in registry: {REGISTRY_PATH}")
+        die(f"invalid project entry in registry: {registry}")
     return data
 
 
 def save_registry(data: dict) -> None:
-    ensure_private_dir(CREDENTIALS_DIR)
+    ensure_private_dir(credentials_dir())
     data["version"] = REGISTRY_VERSION
-    temp = REGISTRY_PATH.with_suffix(".tmp")
-    temp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    registry = registry_path()
+    temp = registry.with_suffix(".tmp")
+    temp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     temp.chmod(0o600)
-    temp.replace(REGISTRY_PATH)
+    temp.replace(registry)
+
+
+def _scan_single_quoted(raw: str):
+    """Decode a leading YAML single-quoted scalar.
+
+    Returns (value, index just past the closing quote), or None when the scalar
+    is never closed.
+    """
+    parts = []
+    index = 1
+    while index < len(raw):
+        character = raw[index]
+        if character == "'":
+            if raw[index + 1:index + 2] == "'":
+                parts.append("'")
+                index += 2
+                continue
+            return "".join(parts), index + 1
+        parts.append(character)
+        index += 1
+    return None
 
 
 def parse_config_name(raw: str, fallback: str) -> str:
     raw = raw.strip()
     if raw.startswith('"'):
+        # Decode only the quoted scalar and let a trailing comment follow it.
+        # Handing the whole remainder to json.loads made `name: "App" # note`
+        # raise and fall back to the directory name, while the shared Fastfile's
+        # YAML.load_file reads it correctly — and this string is the project's
+        # registry key, so the two must not disagree about the app's identity.
         try:
-            value = json.loads(raw)
-            return str(value) if value else fallback
+            value, end = json.JSONDecoder().raw_decode(raw)
         except (ValueError, TypeError):
             return fallback
-    if raw.startswith("'") and raw.endswith("'"):
-        return raw[1:-1].replace("''", "'") or fallback
+        rest = raw[end:].strip()
+        if rest and not rest.startswith("#"):
+            return fallback
+        return str(value) if value else fallback
+    if raw.startswith("'"):
+        scanned = _scan_single_quoted(raw)
+        if scanned is not None and raw[scanned[1]:].strip().startswith("#"):
+            return scanned[0] or fallback
+        if raw.endswith("'"):
+            return raw[1:-1].replace("''", "'") or fallback
     return raw.split(" #", 1)[0].strip() or fallback
 
 
@@ -160,12 +370,143 @@ def config_summary(app: Path) -> tuple[str, list[str]]:
 
 
 def config_setting(app: Path, key: str) -> str:
+    # Both runs are [ \t] rather than \s on purpose: \s matches the newline, so
+    # under re.M the indent could start on a blank line and land on a top-level
+    # key, letting it shadow the nested one this lookup is asking for.
     match = re.search(
-        rf"^\s+{re.escape(key)}:\s*([^#\n]+)",
+        rf"^[ \t]+{re.escape(key)}:[ \t]*([^#\n]+)",
         read(app / CONFIG_NAME),
         re.M,
     )
     return parse_config_name(match.group(1), "") if match else ""
+
+
+def find_top_level_yaml_block(lines: list[str], name: str) -> tuple[int, int] | None:
+    """Line range [start, end) of a top-level `{name}:` block: the line itself
+    through everything until the next top-level key or end of file. Blank
+    lines and comments inside the block do not end it, matching how YAML
+    itself scopes a mapping's nested content."""
+    start = None
+    for i, line in enumerate(lines):
+        if re.match(rf"^{re.escape(name)}:[ \t]*$", line):
+            start = i
+            break
+    if start is None:
+        return None
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        if lines[i] and not lines[i][0].isspace() and not lines[i].startswith("#"):
+            end = i
+            break
+    return start, end
+
+
+def find_yaml_list_block(
+    lines: list[str], within: tuple[int, int], key: str, indent: int
+) -> tuple[int, int] | None:
+    """Line range [start, end) of an indented `{key}:` block and the `- "..."`
+    items one indent level deeper, searched only within `within`. Matches only
+    the exact shape this file writes; a list interleaved with blank lines or
+    comments between items is a hand-editing style this does not follow."""
+    key_prefix = " " * indent
+    item_prefix = " " * (indent + 2)
+    start_within, end_within = within
+    start = None
+    for i in range(start_within, end_within):
+        if re.match(rf"^{key_prefix}{re.escape(key)}:[ \t]*$", lines[i]):
+            start = i
+            break
+    if start is None:
+        return None
+    end = start + 1
+    while end < end_within and lines[end].startswith(item_prefix + "-"):
+        end += 1
+    return start, end
+
+
+def read_yaml_string_list(lines: list[str], span: tuple[int, int] | None) -> list[str]:
+    if span is None:
+        return []
+    start, end = span
+    values = []
+    for line in lines[start + 1 : end]:
+        item = line.strip()
+        if not item.startswith("- "):
+            continue
+        raw = item[2:].strip()
+        try:
+            values.append(json.loads(raw))
+        except (json.JSONDecodeError, ValueError):
+            values.append(raw.strip("\"'"))
+    return values
+
+
+def platform_extra_build_args(app: Path, platform: str) -> list[str]:
+    lines = read(app / CONFIG_NAME).splitlines()
+    section = find_top_level_yaml_block(lines, platform)
+    if section is None:
+        return []
+    return read_yaml_string_list(lines, find_yaml_list_block(lines, section, "extra_build_args", 2))
+
+
+def shared_extra_build_args(app: Path) -> list[str]:
+    lines = read(app / CONFIG_NAME).splitlines()
+    end = len(lines)
+    for i, line in enumerate(lines):
+        if re.match(r"^(android|ios):[ \t]*$", line):
+            end = i
+            break
+    return read_yaml_string_list(lines, find_yaml_list_block(lines, (0, end), "extra_build_args", 0))
+
+
+def set_platform_extra_build_args(app: Path, platform: str, args: list[str]) -> None:
+    """Rewrites only `{platform}:`'s `extra_build_args:` list, preserving every
+    other line — comments, spacing, and the other platform's section — byte
+    for byte. An empty `args` with nothing currently set is a true no-op: the
+    file is not touched, and its mtime does not change."""
+    path = app / CONFIG_NAME
+    text = read(path)
+    lines = text.splitlines()
+    trailing_newline = text.endswith("\n")
+
+    section = find_top_level_yaml_block(lines, platform)
+    if section is None:
+        die(f"{path}: no `{platform}:` section — is this project onboarded for {platform}?")
+
+    existing = find_yaml_list_block(lines, section, "extra_build_args", 2)
+    if existing is None and not args:
+        return
+
+    new_block = []
+    if args:
+        new_block = ["  extra_build_args:"] + [f"    - {json.dumps(a, ensure_ascii=False)}" for a in args]
+
+    if existing is not None:
+        start, end = existing
+        lines[start:end] = new_block
+        if not args and 0 < start < len(lines) and lines[start - 1].strip() == "" and lines[start].strip() == "":
+            del lines[start]
+    else:
+        section_start, section_end = section
+        insert_at = section_end
+        while insert_at > section_start + 1 and lines[insert_at - 1].strip() == "":
+            insert_at -= 1
+        prefix = [""] if insert_at > section_start + 1 and lines[insert_at - 1].strip() != "" else []
+        lines[insert_at:insert_at] = prefix + new_block
+
+    new_text = "\n".join(lines)
+    if trailing_newline or new_text:
+        new_text += "\n"
+    if new_text == text:
+        return
+
+    temp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    temp.write_text(new_text, encoding="utf-8")
+    try:
+        temp.chmod(path.stat().st_mode & 0o777)
+    except OSError:
+        pass
+    os.replace(temp, path)
 
 
 def validate_project_identity(app: Path) -> None:
@@ -284,7 +625,7 @@ def require_managed_app(value: str | None) -> Path:
         die(f"not a Flutter app: {app}")
     if not is_registered(app):
         die(f"{app.name} is not registered — run: frk onboard {app}")
-    if not (app / CONFIG_NAME).is_file() or IMPORT_MARKER not in read(app / "fastlane" / "Fastfile"):
+    if not is_onboarded(app):
         die(f"{app.name} is not onboarded — run: frk onboard {app}")
     validate_project_identity(app)
     return app
@@ -294,9 +635,15 @@ def require_managed_app(value: str | None) -> Path:
 # project inspection
 # --------------------------------------------------------------------------- #
 def read(path: Path) -> str:
+    """Read an optional project file; absent is empty, unreadable is not.
+
+    Only the "it isn't there" errors are absent. A permission or I/O failure
+    used to become "" too, which turned an unreadable Gradle file into an app
+    with no applicationId — a wrong answer where the caller wanted a loud one.
+    """
     try:
-        return path.read_text(errors="replace")
-    except OSError:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except (FileNotFoundError, NotADirectoryError, IsADirectoryError):
         return ""
 
 
@@ -363,6 +710,22 @@ def is_flutter_app(app: Path) -> bool:
     return bool(text) and "flutter:" in text
 
 
+def onboarding_state(app: Path) -> tuple[bool, bool]:
+    """(config written, shared Fastfile imported) — the one onboarding rule.
+
+    Every caller goes through here so the human `frk list` view and the machine
+    API record can never disagree about what "onboarded" means.
+    """
+    return (
+        (app / CONFIG_NAME).is_file(),
+        IMPORT_MARKER in read(app / "fastlane" / "Fastfile"),
+    )
+
+
+def is_onboarded(app: Path) -> bool:
+    return all(onboarding_state(app))
+
+
 def inspect(app: Path) -> dict:
     android_pkg = detect_android_package(app)
     ios_bundle, ios_team = detect_ios(app)
@@ -379,10 +742,7 @@ def inspect(app: Path) -> dict:
         # A configured team AND a non-placeholder bundle id is the real signal.
         "ios_real": real_ios_identity(ios_bundle, ios_team),
         "firebase_android_app_id": detect_firebase_android_app_id(app),
-        "onboarded": (
-            (app / CONFIG_NAME).is_file()
-            and IMPORT_MARKER in read(app / "fastlane" / "Fastfile")
-        ),
+        "onboarded": is_onboarded(app),
     }
 
 
@@ -408,6 +768,13 @@ def render_config(facts: dict, platforms: list[str], track: str) -> str:
         "",
         "# Dart obfuscation + split debug info for Android release builds.",
         "obfuscate: true",
+        "",
+        "# Extra flags appended to every `flutter build`, after this kit's own flags",
+        "# and before --build-name/--build-number. For --dart-define and similar",
+        "# project-specific flags this kit has no opinion about. Must be a list —",
+        "# one flag per item, not several flags in one string.",
+        "# extra_build_args:",
+        "#   - \"--dart-define=KEY=value\"",
         "",
     ]
 
@@ -448,13 +815,13 @@ def render_config(facts: dict, platforms: list[str], track: str) -> str:
 
 def write_file(path: Path, content: str, force: bool, dry: bool) -> str:
     if path.is_file() and not force:
-        if path.read_text() == content:
+        if path.read_text(encoding="utf-8") == content:
             return "unchanged"
         return "exists (use --force to overwrite)"
     if dry:
         return "would write"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content)
+    path.write_text(content, encoding="utf-8")
     return "written"
 
 
@@ -503,7 +870,7 @@ def append_gitignore(app: Path, dry: bool) -> str:
     if dry:
         return f"would add {len(missing)} rule(s)"
 
-    with gi.open("a") as fh:
+    with gi.open("a", encoding="utf-8") as fh:
         if existing and not existing.endswith("\n"):
             fh.write("\n")
         if marker not in existing:
@@ -550,6 +917,41 @@ def export_options_plist(team_id: str, bundle_id: str) -> str:
 """
 
 
+def select_platforms(facts: dict, requested: str | None) -> list[str]:
+    """Resolve the platforms to onboard: an explicit list wins, otherwise detect.
+
+    Raises ValueError with the message the CLI prints, so the decision is
+    testable without a project directory.
+    """
+    if requested:
+        platforms = list(dict.fromkeys(
+            p.strip().lower() for p in requested.split(",") if p.strip()
+        ))
+        bad = [p for p in platforms if p not in ("android", "ios")]
+        if bad:
+            raise ValueError(f"unknown platform(s): {', '.join(bad)}")
+    else:
+        platforms = []
+        if facts["android_real"]:
+            platforms.append("android")
+        if facts["ios_real"]:
+            platforms.append("ios")
+
+    if not platforms:
+        raise ValueError(
+            "could not determine any release-ready platform.\n"
+            "  Android needs a real applicationId; iOS needs DEVELOPMENT_TEAM and a\n"
+            "  non-placeholder bundle id. Configure those identifiers in the app,\n"
+            "  or pass the matching --android-package / --ios-bundle-id / --ios-team-id overrides."
+        )
+
+    if "ios" in platforms and not facts["ios_real"]:
+        raise ValueError("iOS requested but its bundle id or 10-character DEVELOPMENT_TEAM is missing, invalid, or placeholder")
+    if "android" in platforms and not facts["android_real"]:
+        raise ValueError("Android requested but its applicationId is missing, invalid, or still com.example.*")
+    return platforms
+
+
 def cmd_onboard(args) -> int:
     app = Path(args.app_dir).expanduser().resolve()
     if not app.is_dir():
@@ -582,33 +984,10 @@ def cmd_onboard(args) -> int:
     info(f"ios bundle id   {facts['ios_bundle_id'] or '-'}")
     info(f"ios team        {facts['ios_team_id'] or '-'}")
 
-    # Platform selection: explicit flag wins, otherwise detect.
-    if args.platforms:
-        platforms = list(dict.fromkeys(
-            p.strip().lower() for p in args.platforms.split(",") if p.strip()
-        ))
-        bad = [p for p in platforms if p not in ("android", "ios")]
-        if bad:
-            die(f"unknown platform(s): {', '.join(bad)}")
-    else:
-        platforms = []
-        if facts["android_real"]:
-            platforms.append("android")
-        if facts["ios_real"]:
-            platforms.append("ios")
-
-    if not platforms:
-        die(
-            "could not determine any release-ready platform.\n"
-            "  Android needs a real applicationId; iOS needs DEVELOPMENT_TEAM and a\n"
-            "  non-placeholder bundle id. Configure those identifiers in the app,\n"
-            "  or pass the matching --android-package / --ios-bundle-id / --ios-team-id overrides."
-        )
-
-    if "ios" in platforms and not facts["ios_real"]:
-        die("iOS requested but its bundle id or 10-character DEVELOPMENT_TEAM is missing, invalid, or placeholder")
-    if "android" in platforms and not facts["android_real"]:
-        die("Android requested but its applicationId is missing, invalid, or still com.example.*")
+    try:
+        platforms = select_platforms(facts, args.platforms)
+    except ValueError as exc:
+        die(str(exc))
 
     head("Platforms")
     if "android" in platforms:
@@ -689,12 +1068,12 @@ def cmd_onboard(args) -> int:
         # The registry is the opt-in boundary: merely living below a common
         # workspace directory never makes an app managed by this tool.
         register_project(app)
-        ok(f"registered as a managed project in {REGISTRY_PATH}")
+        ok(f"registered as a managed project in {registry_path()}")
     return 0
 
 
 # --------------------------------------------------------------------------- #
-# other commands
+# Fastlane-driven commands: doctor, verify, build, release
 # --------------------------------------------------------------------------- #
 def cmd_doctor(args) -> int:
     return run_fastlane(require_managed_app(args.app_dir), ["doctor"])
@@ -710,6 +1089,22 @@ def fastlane_env() -> dict:
     }
 
 
+def fastlane_installed() -> bool:
+    return shutil.which("fastlane") is not None
+
+
+def fastlane_command(
+    lane: list[str],
+    options: list[str] | None = None,
+    *,
+    prevent_sleep: bool = False,
+) -> list[str]:
+    command = ["fastlane", *lane, *(options or [])]
+    if prevent_sleep and sys.platform == "darwin" and shutil.which("caffeinate"):
+        command = ["caffeinate", "-ims", *command]
+    return command
+
+
 def run_fastlane(
     app: Path,
     lane: list[str],
@@ -717,14 +1112,60 @@ def run_fastlane(
     *,
     prevent_sleep: bool = False,
 ) -> int:
-    if shutil.which("fastlane") is None:
+    if not fastlane_installed():
         die("fastlane is not installed — run `brew install fastlane`")
-    command = ["fastlane", *lane, *(options or [])]
-    if prevent_sleep and sys.platform == "darwin" and shutil.which("caffeinate"):
-        command = ["caffeinate", "-ims", *command]
+    command = fastlane_command(lane, options, prevent_sleep=prevent_sleep)
     head(f"{app.name}: {' '.join(command)}")
     sys.stdout.flush()
     return subprocess.call(command, cwd=app, env=fastlane_env())
+
+
+def capture_fastlane(app: Path, lane: list[str], *, timeout: int) -> tuple[int, str]:
+    """Run one lane to completion and hand back its output instead of printing it.
+
+    The streaming sibling above is wrong for a document command twice over: it
+    lets the child write straight onto this process's stdout, which would
+    interleave fastlane chatter with the single JSON document a client is
+    parsing, and it waits forever. Nothing here reaches stdout — the caller
+    decides which of these bytes are an answer.
+
+    Raises subprocess.TimeoutExpired once the child stops making progress, after
+    killing it. `start_new_session` puts fastlane in its own process group so the
+    kill reaches ruby and whatever it spawned; signalling the pid alone would
+    leave the store connection open behind an already-answered command.
+    """
+    environment = {**fastlane_env(), "FASTLANE_DISABLE_COLORS": "1", "TERM": "dumb"}
+    process = subprocess.Popen(
+        fastlane_command(lane),
+        cwd=app,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        start_new_session=True,
+    )
+    try:
+        output, _ = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        signal_process_group(process, signal.SIGTERM)
+        try:
+            process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            signal_process_group(process, signal.SIGKILL)
+            process.communicate()
+        raise
+    return process.returncode, output
+
+
+def signal_process_group(process, number: int) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, number)
+    except OSError:
+        pass
 
 
 def lane_options(args, *, release: bool) -> list[str]:
@@ -789,6 +1230,9 @@ def cmd_release(args) -> int:
     return run_fastlane(app, lane, options, prevent_sleep=True)
 
 
+# --------------------------------------------------------------------------- #
+# managed-project registry commands
+# --------------------------------------------------------------------------- #
 def cmd_list(args) -> int:
     projects = managed_projects()
     print(f"\n{_c('1', 'Managed Flutter apps (opt-in only)')}\n")
@@ -802,11 +1246,7 @@ def cmd_list(args) -> int:
     for entry in projects:
         app = Path(entry.get("path", "")).expanduser()
         app_exists = app.is_dir()
-        ready = (
-            app_exists
-            and (app / CONFIG_NAME).is_file()
-            and IMPORT_MARKER in read(app / "fastlane" / "Fastfile")
-        )
+        ready = app_exists and is_onboarded(app)
         if ready:
             name, platforms = config_summary(app)
             version = pubspec_version(app) or "-"
@@ -823,8 +1263,23 @@ def cmd_list(args) -> int:
     return 0
 
 
+def cmd_forget(args) -> int:
+    app = resolve_app(args.app_dir)
+    data = load_registry()
+    before = len(data["projects"])
+    data["projects"] = [
+        p for p in data["projects"]
+        if Path(p.get("path", "")).expanduser().resolve() != app
+    ]
+    if len(data["projects"]) == before:
+        die(f"{app} is not in the managed-project registry")
+    save_registry(data)
+    ok(f"forgot {app}; no project files were changed")
+    return 0
+
+
 # --------------------------------------------------------------------------- #
-# Versioned machine API for native/automation clients
+# Versioned machine API: wire format and payload helpers
 # --------------------------------------------------------------------------- #
 def api_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
@@ -850,6 +1305,56 @@ def api_document(**payload) -> dict:
     }
 
 
+def api_print(**payload) -> None:
+    """Write one request/response document. Keyword order is the wire order.
+
+    Unlike api_emit this does not flush: these are one-shot commands whose
+    output is flushed at exit, and forcing a flush here would change when
+    a client blocked on a pipe sees the bytes.
+    """
+    print(json.dumps(api_document(**payload), ensure_ascii=False, separators=(",", ":")))
+
+
+def api_error(code: str, message: str) -> int:
+    """Emit the standard error document and return the process exit code."""
+    api_print(error={"code": code, "message": message})
+    return 1
+
+
+def api_error_exit(code: str, message: str, status: int = 1) -> int:
+    """Emit the error document for a failure that escaped a command body.
+
+    Same wire shape as api_error; separate so the caller can keep the exit code
+    the command would have used. A machine-API command must never answer a
+    failure with nothing, and must never answer it with zero.
+    """
+    api_print(error={"code": code, "message": message})
+    return status or 1
+
+
+def api_failure_channel(args, code: str, message: str, status: int) -> int | None:
+    """Report an escaped failure on whichever channel this command speaks.
+
+    Returns None for a human command, whose contract is a sentence on stderr —
+    the marker is set per subparser, not inferred from "belongs to `api`",
+    because `api run` is JSON Lines and the rest are single documents.
+    """
+    if getattr(args, "api_document_command", False):
+        return api_error_exit(code, message, status)
+    if getattr(args, "api_stream_command", False):
+        action = getattr(args, "action", None)
+        api_emit("error", action=action, code=code, message=message)
+        # `finished` always carries durationSeconds per docs/MACHINE_API.md.
+        # This path is reached from main()'s handler, which has no start time in
+        # scope, so it reports 0.0 — the same value the invalid_request path in
+        # cmd_api_run uses for a request that never started a child.
+        api_emit(
+            "finished", action=action, success=False, exitCode=status or 1, durationSeconds=0.0
+        )
+        return status or 1
+    return None
+
+
 def split_pubspec_version(value: str | None) -> tuple[str | None, int | None]:
     if not value:
         return None, None
@@ -873,26 +1378,49 @@ def newest_path(paths) -> Path | None:
     return max(files, key=lambda path: path.stat().st_mtime) if files else None
 
 
-def env_values(path: Path) -> dict[str, str]:
-    values = {}
+# --------------------------------------------------------------------------- #
+# shared store-credential vault
+# --------------------------------------------------------------------------- #
+def env_pairs(path: Path) -> list[tuple[str, str]]:
+    """Every assignment in a .env file, in file order, repeats included.
+
+    Blank lines, `#` comments and lines without `=` are skipped. Callers that
+    report what the file *says* (rather than what it resolves to) need the
+    repeats: uncommenting a template line for a key that is already set is a
+    common mistake, and collapsing it would hide it.
+    """
+    pairs = []
     for line in read(path).splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        values[key.strip()] = value.strip().strip('"\'')
-    return values
+        pairs.append((key.strip(), value.strip().strip('"\'')))
+    return pairs
 
 
-def ensure_credential_vault() -> Path:
-    """Create only the private shared-credential structure, idempotently."""
-    for directory in (CREDENTIALS_DIR, CREDENTIALS_DIR / "asc", CREDENTIALS_DIR / "play"):
+def env_values(path: Path) -> dict[str, str]:
+    """Effective values, last assignment winning — what the shell would export."""
+    return dict(env_pairs(path))
+
+
+def ensure_credential_vault(*, include_signing: bool = False) -> Path:
+    """Create the private shared-credential structure, idempotently.
+
+    `include_signing` also creates the Android keystore directory, which only
+    `frk setup` wants: importing a store credential must not conjure it.
+    """
+    vault = credentials_dir()
+    directories = [vault, vault / "asc", vault / "play"]
+    if include_signing:
+        directories.append(signing_dir())
+    for directory in directories:
         ensure_private_dir(directory)
-    env_file = CREDENTIALS_DIR / "credentials.env"
+    env_file = vault / "credentials.env"
     if env_file.exists() and not env_file.is_file():
         raise ValueError(f"credentials path is not a file: {env_file}")
     if not env_file.exists():
-        env_file.write_text(CREDENTIALS_ENV_TEMPLATE)
+        env_file.write_text(CREDENTIALS_ENV_TEMPLATE, encoding="utf-8")
     env_file.chmod(0o600)
     return env_file
 
@@ -917,17 +1445,40 @@ def update_env_values(path: Path, updates: dict[str, str]) -> None:
         if key not in written:
             output.append(f"{key}={value}")
     temp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    temp.write_text("\n".join(output).rstrip() + "\n")
+    temp.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
     temp.chmod(0o600)
     os.replace(temp, path)
 
 
-def resolve_shared_credential_path(value: str) -> Path | None:
+def credential_value(key: str, app: Path | None = None, shared: dict[str, str] | None = None) -> str:
+    """Mirror Fastlane's environment > app .env > shared credential precedence.
+
+    `app` of None skips the middle tier entirely. `shared` accepts an already
+    parsed credentials.env so a caller reading several keys pays one file read.
+    """
+    if os.environ.get(key, "").strip():
+        return os.environ[key].strip()
+    if app is not None:
+        app_value = env_values(app / "fastlane" / ".env").get(key, "").strip()
+        if app_value:
+            return app_value
+    if shared is None:
+        shared = env_values(credentials_dir() / "credentials.env")
+    return shared.get(key, "").strip()
+
+
+def resolve_credential_path(value: str, app: Path | None = None) -> Path | None:
+    """Locate a credential file named by a config value; None if it is not there."""
     if not value:
         return None
     raw = Path(os.path.expandvars(os.path.expanduser(value)))
-    candidate = raw if raw.is_absolute() else CREDENTIALS_DIR / raw
-    return candidate.resolve() if candidate.is_file() else None
+    if raw.is_absolute():
+        candidates = [raw]
+    elif app is not None:
+        candidates = [app / raw, credentials_dir() / raw]
+    else:
+        candidates = [credentials_dir() / raw]
+    return next((path.resolve() for path in candidates if path.is_file()), None)
 
 
 def _private_copy(source: Path, target: Path, *, force: bool) -> None:
@@ -957,7 +1508,7 @@ def _play_key_details(path: Path | None) -> tuple[bool, str, str | None, str | N
     if not path:
         return False, "Service-account JSON is not configured", None, None
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         return False, f"Service-account JSON is unreadable: {exc}", None, None
     required = ("type", "project_id", "private_key_id", "private_key", "client_email")
@@ -975,7 +1526,7 @@ def _asc_key_details(path: Path | None) -> tuple[bool, str]:
     if not path:
         return False, "App Store Connect .p8 key is not configured"
     try:
-        content = path.read_text().strip()
+        content = path.read_text(encoding="utf-8").strip()
     except (OSError, UnicodeDecodeError) as exc:
         return False, f"App Store Connect key is unreadable: {exc}"
     if "-----BEGIN PRIVATE KEY-----" not in content or "-----END PRIVATE KEY-----" not in content:
@@ -984,17 +1535,20 @@ def _asc_key_details(path: Path | None) -> tuple[bool, str]:
 
 
 def credential_status_record() -> dict:
-    shared = env_values(CREDENTIALS_DIR / "credentials.env")
+    vault = credentials_dir()
+    # Machine-wide report: `app=None` throughout, on purpose. This describes the
+    # shared vault, so a per-app fastlane/.env must not colour the answer.
+    shared = env_values(vault / "credentials.env")
 
-    play_value = os.environ.get("SUPPLY_JSON_KEY", "").strip() or shared.get("SUPPLY_JSON_KEY", "").strip()
-    play_path = resolve_shared_credential_path(play_value)
+    play_value = credential_value("SUPPLY_JSON_KEY", shared=shared)
+    play_path = resolve_credential_path(play_value)
     play_valid, play_detail, client_email, project_id = _play_key_details(play_path)
 
-    key_id = os.environ.get("ASC_KEY_ID", "").strip() or shared.get("ASC_KEY_ID", "").strip()
-    issuer_id = os.environ.get("ASC_ISSUER_ID", "").strip() or shared.get("ASC_ISSUER_ID", "").strip()
-    key_content = os.environ.get("ASC_KEY_CONTENT", "").strip() or shared.get("ASC_KEY_CONTENT", "").strip()
-    key_value = os.environ.get("ASC_KEY_FILEPATH", "").strip() or shared.get("ASC_KEY_FILEPATH", "").strip()
-    key_path = resolve_shared_credential_path(key_value)
+    key_id = credential_value("ASC_KEY_ID", shared=shared)
+    issuer_id = credential_value("ASC_ISSUER_ID", shared=shared)
+    key_content = credential_value("ASC_KEY_CONTENT", shared=shared)
+    key_value = credential_value("ASC_KEY_FILEPATH", shared=shared)
+    key_path = resolve_credential_path(key_value)
     if key_content:
         key_valid = "BEGIN PRIVATE KEY" in key_content and "END PRIVATE KEY" in key_content
         key_detail = "App Store Connect API key content is valid" if key_valid else "ASC_KEY_CONTENT is malformed"
@@ -1010,7 +1564,7 @@ def credential_status_record() -> dict:
         key_detail = "App Store Connect Issuer ID must be a UUID"
 
     return {
-        "vaultPath": str(CREDENTIALS_DIR.resolve()),
+        "vaultPath": str(vault.resolve()),
         "configuredAny": bool(play_valid or asc_valid),
         "googlePlay": {
             "configured": play_valid,
@@ -1039,7 +1593,7 @@ def configure_play_credentials(source_value: str, *, force: bool) -> dict:
     if not valid:
         raise ValueError(detail)
     env_file = ensure_credential_vault()
-    target = CREDENTIALS_DIR / "play" / "service-account.json"
+    target = credentials_dir() / "play" / "service-account.json"
     _private_copy(source, target, force=force)
     update_env_values(env_file, {"SUPPLY_JSON_KEY": "play/service-account.json"})
     return credential_status_record()
@@ -1059,7 +1613,7 @@ def configure_asc_credentials(source_value: str, key_id: str | None, issuer_id: 
     if not valid:
         raise ValueError(detail)
     env_file = ensure_credential_vault()
-    target = CREDENTIALS_DIR / "asc" / f"AuthKey_{key_id}.p8"
+    target = credentials_dir() / "asc" / f"AuthKey_{key_id}.p8"
     _private_copy(source, target, force=force)
     update_env_values(env_file, {
         "ASC_KEY_ID": key_id,
@@ -1069,33 +1623,15 @@ def configure_asc_credentials(source_value: str, key_id: str | None, issuer_id: 
     return credential_status_record()
 
 
-def setup_credential(app: Path, key: str) -> str:
-    """Mirror Fastlane's environment > app .env > shared credential precedence."""
-    if os.environ.get(key, "").strip():
-        return os.environ[key].strip()
-    app_value = env_values(app / "fastlane" / ".env").get(key, "").strip()
-    if app_value:
-        return app_value
-    return env_values(CREDENTIALS_DIR / "credentials.env").get(key, "").strip()
-
-
-def resolve_setup_credential_path(app: Path, value: str) -> Path | None:
-    if not value:
-        return None
-    raw = Path(os.path.expandvars(os.path.expanduser(value)))
-    candidates = [raw] if raw.is_absolute() else [app / raw, CREDENTIALS_DIR / raw]
-    return next((path.resolve() for path in candidates if path.is_file()), None)
-
-
 def asc_credentials_ready(app: Path) -> bool:
-    key_id = setup_credential(app, "ASC_KEY_ID")
-    issuer_id = setup_credential(app, "ASC_ISSUER_ID")
-    content = setup_credential(app, "ASC_KEY_CONTENT")
-    filepath = setup_credential(app, "ASC_KEY_FILEPATH")
-    resolved = resolve_setup_credential_path(app, filepath)
+    key_id = credential_value("ASC_KEY_ID", app)
+    issuer_id = credential_value("ASC_ISSUER_ID", app)
+    content = credential_value("ASC_KEY_CONTENT", app)
+    filepath = credential_value("ASC_KEY_FILEPATH", app)
+    resolved = resolve_credential_path(filepath, app)
 
     if not content and not resolved:
-        candidates = list((CREDENTIALS_DIR / "asc").glob("AuthKey_*.p8"))
+        candidates = list((credentials_dir() / "asc").glob("AuthKey_*.p8"))
         candidates += list((app / "key").glob("AuthKey_*.p8"))
         if key_id:
             candidates = [path for path in candidates if path.name == f"AuthKey_{key_id}.p8"]
@@ -1106,6 +1642,9 @@ def asc_credentials_ready(app: Path) -> bool:
     return bool(key_id and issuer_id and (content or resolved))
 
 
+# --------------------------------------------------------------------------- #
+# per-project signing and release-setup records
+# --------------------------------------------------------------------------- #
 def android_gradle_signing_record(app: Path) -> dict:
     """Conservatively confirm that release builds consume key.properties."""
     candidates = [
@@ -1148,10 +1687,16 @@ def decode_provisioning_profile(path: Path) -> tuple[dict | None, str | None]:
     security = shutil.which("security")
     if not security:
         return None, "macOS security tool is unavailable"
-    result = subprocess.run(
-        [security, "cms", "-D", "-i", str(path)],
-        capture_output=True,
-    )
+    try:
+        result = subprocess.run(
+            [security, "cms", "-D", "-i", str(path)],
+            capture_output=True,
+            timeout=20,
+        )
+    except subprocess.TimeoutExpired:
+        # The one probe in this file with a channel for the reason, so it says
+        # what happened instead of borrowing the "tool is absent" sentence.
+        return None, "the macOS security tool did not answer in time"
     if result.returncode:
         detail = result.stderr.decode(errors="replace").strip().splitlines()
         return None, detail[-1] if detail else "the profile could not be decoded"
@@ -1263,33 +1808,68 @@ def ios_export_options_record(app: Path, bundle: str, team: str) -> dict:
     }
 
 
-_distribution_identities_cache: list[dict[str, str]] | None = None
-
-
 def distribution_identities() -> list[dict[str, str]]:
-    """Return usable local distribution identities without certificate data."""
-    global _distribution_identities_cache
-    if _distribution_identities_cache is not None:
-        return _distribution_identities_cache
+    """Return usable local distribution identities without certificate data.
+
+    An empty list means one of two very different things and the caller has to
+    be able to tell them apart: "the keychain was read and holds no
+    distribution identity", or "the keychain could not be read at all". The
+    second is recorded as a sentence on `distribution_identities.unavailable`,
+    because reporting it as the first sends the user off to mint a duplicate
+    distribution certificate — costly, and hard to undo once it exists.
+    """
+    distribution_identities.unavailable = None
+    if distribution_identities.cache is not None:
+        return distribution_identities.cache
     security = shutil.which("security")
     if not security:
-        _distribution_identities_cache = []
+        distribution_identities.cache = []
         return []
-    result = subprocess.run(
-        [security, "find-identity", "-v", "-p", "codesigning"],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            [security, "find-identity", "-v", "-p", "codesigning"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=KEYCHAIN_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        distribution_identities.unavailable = (
+            "Keychain could not be read: the macOS security tool did not answer within "
+            f"{KEYCHAIN_TIMEOUT_SECONDS}s, so whether a distribution certificate exists is unknown"
+        )
+        return []
+    # Only a successful lookup is memoised. A locked keychain or a wedged
+    # `security` used to be cached as "this machine has no distribution
+    # identity" for the rest of the process, which then reported every iOS app
+    # as unsigned — the answer was wrong and there was no way back to the truth.
+    if result.returncode != 0:
+        distribution_identities.unavailable = (
+            "Keychain could not be read: the macOS security tool failed (a locked keychain "
+            "reports this), so whether a distribution certificate exists is unknown"
+        )
+        return []
     identities = []
     for fingerprint, name in re.findall(r'^\s*\d+\)\s+([A-Fa-f0-9]{40})\s+"([^"]+)"', result.stdout, re.M):
         if re.search(r"Apple Distribution|iPhone Distribution", name):
             identities.append({"fingerprint": fingerprint.upper(), "name": name})
-    _distribution_identities_cache = identities
+    distribution_identities.cache = identities
     return identities
+
+
+# Kept on the function rather than in a module global: a caller that reaches the
+# function reaches its cache too, so the keychain stays out of reach of tests
+# however this file is later split up. None means "not looked up yet".
+distribution_identities.cache = None
+# Reason the last lookup could not be performed, or None when it really ran.
+# Reset on every call, so it always describes the answer just returned.
+distribution_identities.unavailable = None
 
 
 def distribution_identity_record(team: str) -> dict:
     identities = distribution_identities()
+    unavailable = distribution_identities.unavailable
     matching = [identity for identity in identities if team in identity["name"]]
     # Older iPhone Distribution identities do not always expose the team id in
     # their display name. A single unambiguous identity is still usable; the
@@ -1301,18 +1881,19 @@ def distribution_identity_record(team: str) -> dict:
         detail = "One distribution identity is available; the profile check confirms whether it belongs to this app"
     elif identities:
         detail = f"Distribution identities exist, but none can be associated with team {team}"
+    elif unavailable:
+        # Never "no certificate exists" here: nothing was observed at all.
+        detail = unavailable
     else:
         detail = "No Apple Distribution certificate with its private key is available in Keychain"
     return {
         "ready": bool(usable),
+        # False means the lookup did not happen, so `ready: False` is a
+        # fail-closed placeholder rather than a finding about this machine.
+        "checked": unavailable is None,
         "detail": detail,
         "fingerprints": [identity["fingerprint"] for identity in usable],
     }
-
-
-def distribution_identity_ready() -> bool:
-    """Compatibility helper for status screens that are not team-specific."""
-    return bool(distribution_identities())
 
 
 def android_setup_record(app: Path, package: str) -> dict:
@@ -1332,20 +1913,27 @@ def android_setup_record(app: Path, package: str) -> dict:
         }
     )
     gradle = android_gradle_signing_record(app)
+    begin_git_checks()
     properties_tracked = git_tracks(app, "android/key.properties")
     keystore_tracked = bool(project_store and git_tracks_path(project_store))
     properties_ignored = git_ignores(app, "android/key.properties")
     keystore_ignored = bool(
         not project_store or git_path_is_ignored_or_external(project_store)
     )
+    # A record is built per project, so the group is reset per project too. The
+    # flag outlives this call on purpose: it is the only channel a caller has
+    # for telling "verified safe" apart from "never answered", and the v1 key
+    # set is frozen so no field can carry it.
+    git_checked = not git_check_timed_out()
     git_safe = (
-        not properties_tracked
+        git_checked
+        and not properties_tracked
         and not keystore_tracked
         and properties_ignored
         and keystore_ignored
     )
 
-    vault = SIGNING_DIR / package
+    vault = signing_dir() / package
     vault_props = vault / "key.properties"
     vault_values = read_properties(vault_props) if vault_props.is_file() else {}
     vault_complete = all(vault_values.get(key) for key in ANDROID_SIGNING_KEYS)
@@ -1389,7 +1977,7 @@ def android_setup_record(app: Path, package: str) -> dict:
 
 
 def ios_setup_record(app: Path, bundle: str, team: str) -> dict:
-    profile = SIGNING_DIR / "ios" / team / f"AppStore_{bundle}.mobileprovision"
+    profile = signing_dir() / "ios" / team / f"AppStore_{bundle}.mobileprovision"
     workspace = app / "ios" / "Runner.xcworkspace"
     detected_bundle, detected_team = detect_ios(app)
     project_identity_ready = detected_bundle == bundle and detected_team == team
@@ -1420,6 +2008,9 @@ def ios_setup_record(app: Path, bundle: str, team: str) -> dict:
         "workspacePath": str(workspace),
         "workspaceExists": workspace.is_dir(),
         "distributionIdentityReady": identity_ready,
+        # Carries the "keychain could not be read" sentence when the lookup
+        # never ran, so `distributionIdentityReady: false` is not mistaken for
+        # a finding that this machine holds no distribution certificate.
         "distributionIdentityDetail": identity_detail,
         "ascCredentialsReady": asc_credentials_ready(app),
         "profilePath": str(profile),
@@ -1460,9 +2051,9 @@ def setup_status_record(entry: dict) -> dict:
 def project_api_record(entry: dict) -> dict:
     app = Path(entry.get("path", "")).expanduser()
     exists = app.is_dir()
-    configured = exists and (app / CONFIG_NAME).is_file()
-    imported = exists and IMPORT_MARKER in read(app / "fastlane" / "Fastfile")
-    onboarded = bool(configured and imported)
+    # No `exists` guard needed: a directory that is gone cannot hold either file.
+    configured, imported = onboarding_state(app)
+    onboarded = configured and imported
     name = entry.get("name") or app.name or "Unknown"
     platforms = list(entry.get("platforms") or [])
     version = None
@@ -1529,6 +2120,150 @@ def project_api_record(entry: dict) -> dict:
     }
 
 
+# --------------------------------------------------------------------------- #
+# store version report (READ ONLY)
+# --------------------------------------------------------------------------- #
+# `frk api store-versions` answers one question: which version numbers do Google
+# Play and App Store Connect already hold? It reports facts and nothing else.
+# There is deliberately no next/suggested/incremented field anywhere below —
+# version numbers are never chosen by this tool, and a client that wants to
+# propose one computes it from these facts and makes the user click it.
+#
+# bin/frk cannot ask the stores itself (signing a Play OAuth assertion needs
+# RS256, which the standard library cannot do), so the whole store conversation
+# happens in `fastlane store_versions`. This side owns exactly two jobs: find
+# the lane's one marker line in a stream of fastlane chatter, and rebuild the
+# document field by field from what that line says. Nothing is copied across
+# wholesale — an unknown key in the lane's payload cannot reach the document,
+# because the document is constructed key by key from a fixed list.
+def store_versions_text(value, *, limit: int = STORE_VERSIONS_MAX_DETAIL) -> str | None:
+    """One safe human sentence, or None when there is nothing usable to say."""
+    if not isinstance(value, str):
+        return None
+    stripped = ANSI_ESCAPE.sub("", value).replace("\r", "\n")
+    # First line only. A multi-line store error is a stack trace, and the tail of
+    # one is where the interesting paths live.
+    first = stripped.split("\n", 1)[0]
+    cleaned = "".join(character for character in first if character >= " " or character == "\t")
+    for pattern in STORE_VERSIONS_REDACTIONS:
+        cleaned = pattern.sub("<redacted>", cleaned)
+    cleaned = cleaned.strip()
+    if not cleaned:
+        return None
+    return cleaned if len(cleaned) <= limit else cleaned[: limit - 1].rstrip() + "…"
+
+
+def store_versions_token(value, pattern: re.Pattern, *, limit: int = 64) -> str | None:
+    """A short value that matches a known shape, or None. Never a free string."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text if 0 < len(text) <= limit and pattern.fullmatch(text) else None
+
+
+def store_versions_number(value) -> int | None:
+    """A real store number, or None. Never a string, never 0 for 'unknown'."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 1 <= value <= STORE_VERSIONS_MAX_NUMBER else None
+
+
+def store_versions_status(value) -> str:
+    return value if value in STORE_VERSIONS_STATUSES else "unavailable"
+
+
+def store_versions_android(raw) -> dict:
+    """The android object, always with the same keys whatever the lane sent."""
+    section = raw if isinstance(raw, dict) else {}
+    tracks = []
+    for item in section.get("tracks") if isinstance(section.get("tracks"), list) else []:
+        if len(tracks) == STORE_VERSIONS_MAX_TRACKS:
+            break
+        if not isinstance(item, dict):
+            continue
+        track = store_versions_token(item.get("track"), STORE_VERSIONS_TRACK)
+        code = store_versions_number(item.get("versionCode"))
+        # An entry without both a track and a code says nothing; a half-entry
+        # would only invite a client to render "track: null".
+        if not track or code is None:
+            continue
+        tracks.append({
+            "track": track,
+            "versionCode": code,
+            "versionName": store_versions_token(item.get("versionName"), STORE_VERSIONS_VERSION),
+        })
+    return {
+        "status": store_versions_status(section.get("status")),
+        "detail": store_versions_text(section.get("detail"))
+        or "The store report carried no description of the Google Play result.",
+        "track": store_versions_token(section.get("track"), STORE_VERSIONS_TRACK),
+        "latestVersionCode": store_versions_number(section.get("latestVersionCode")),
+        "latestVersionName": store_versions_token(
+            section.get("latestVersionName"), STORE_VERSIONS_VERSION
+        ),
+        "tracks": tracks,
+    }
+
+
+def store_versions_ios(raw) -> dict:
+    """The ios object, always with the same keys whatever the lane sent."""
+    section = raw if isinstance(raw, dict) else {}
+    builds = []
+    for item in section.get("builds") if isinstance(section.get("builds"), list) else []:
+        if len(builds) == STORE_VERSIONS_MAX_BUILDS:
+            break
+        if not isinstance(item, dict):
+            continue
+        entry = {
+            "version": store_versions_token(item.get("version"), STORE_VERSIONS_VERSION),
+            # null is a real answer here: a CFBundleVersion of "1.2.3" is not a
+            # build number, and inventing an integer for it would be a lie the
+            # client cannot detect.
+            "build": store_versions_number(item.get("build")),
+            "state": store_versions_token(item.get("state"), STORE_VERSIONS_STATE, limit=40),
+        }
+        if any(value is not None for value in entry.values()):
+            builds.append(entry)
+    return {
+        "status": store_versions_status(section.get("status")),
+        "detail": store_versions_text(section.get("detail"))
+        or "The store report carried no description of the App Store Connect result.",
+        "latestAppStoreVersion": store_versions_token(
+            section.get("latestAppStoreVersion"), STORE_VERSIONS_VERSION
+        ),
+        "builds": builds,
+    }
+
+
+def store_versions_checked_at(raw: dict) -> str:
+    """When the stores were read: the lane's moment, or ours if it sent nonsense."""
+    reported = raw.get("checkedAt")
+    if isinstance(reported, str) and STORE_VERSIONS_TIMESTAMP.fullmatch(reported.strip()):
+        return reported.strip()
+    return api_timestamp()
+
+
+def store_versions_marker_payload(output: str) -> str | None:
+    """The JSON text carried by the last marker line, or None if there is none.
+
+    The lane's contract: the marker can appear anywhere in a line (fastlane
+    prefixes its own timestamps), it is not necessarily the last line of output
+    (fastlane appends a run summary after it), and if several lines carry one the
+    last wins. Everything else in `output` is chatter and is dropped here — it
+    never reaches the document, however interesting it looks.
+    """
+    payload = None
+    for raw in output.splitlines():
+        line = ANSI_ESCAPE.sub("", raw)
+        index = line.rfind(STORE_VERSIONS_MARKER)
+        if index >= 0:
+            payload = line[index + len(STORE_VERSIONS_MARKER):].strip()
+    return payload
+
+
+# --------------------------------------------------------------------------- #
+# api subcommands
+# --------------------------------------------------------------------------- #
 def api_find_project(value: str) -> dict | None:
     requested = Path(value).expanduser()
     requested_path = requested.resolve() if requested.exists() else None
@@ -1540,7 +2275,7 @@ def api_find_project(value: str) -> dict | None:
 
 
 def cmd_api_capabilities(args) -> int:
-    print(json.dumps(api_document(
+    api_print(
         minimumDesktopProtocol=1,
         maximumDesktopProtocol=API_PROTOCOL_VERSION,
         capabilities={
@@ -1549,51 +2284,177 @@ def cmd_api_capabilities(args) -> int:
             "credentialManagement": True,
             "productionRelease": False,
             "platforms": ["android", "ios"],
-            "actions": [
-                "onboard", "doctor", "verify", "build", "validate",
-                "release", "signing-audit", "signing-import", "signing-link",
-                "ios-setup-signing", "status", "forget", "credentials", "configure-credentials",
-            ],
+            # `api credentials` and `api configure-credentials` are `api`
+            # subcommands, not `api run` actions, and were never accepted here.
+            "actions": list(API_RUN_ACTIONS),
+            # The document surface deliberately does not get a key of its own
+            # here. The v1 capabilities key set is frozen by
+            # tests/fixtures/api_v1_keys.json, and adding one is a protocol
+            # change, not a feature flag. API_DOCUMENT_COMMANDS is the list;
+            # putting a document command into `actions` instead is the bug that
+            # sent `credentials` and `configure-credentials` to a client that
+            # then got an argparse usage block from `api run`.
         },
-    ), ensure_ascii=False, separators=(",", ":")))
+    )
     return 0
 
 
 def cmd_api_projects(args) -> int:
-    records = [project_api_record(entry) for entry in managed_projects()]
-    print(json.dumps(api_document(projects=records), ensure_ascii=False, separators=(",", ":")))
+    api_print(projects=[project_api_record(entry) for entry in managed_projects()])
     return 0
 
 
 def cmd_api_project(args) -> int:
     entry = api_find_project(args.app_dir)
     if not entry:
-        print(json.dumps(api_document(error={
-            "code": "project_not_found",
-            "message": f"No managed project named or located at {args.app_dir}",
-        }), ensure_ascii=False, separators=(",", ":")))
-        return 1
-    print(json.dumps(api_document(project=project_api_record(entry)),
-                     ensure_ascii=False, separators=(",", ":")))
+        return api_error("project_not_found", f"No managed project named or located at {args.app_dir}")
+    api_print(project=project_api_record(entry))
     return 0
 
 
 def cmd_api_setup(args) -> int:
     entry = api_find_project(args.app_dir)
     if not entry:
-        print(json.dumps(api_document(error={
-            "code": "project_not_found",
-            "message": f"No managed project named or located at {args.app_dir}",
-        }), ensure_ascii=False, separators=(",", ":")))
-        return 1
-    print(json.dumps(api_document(**setup_status_record(entry)),
-                     ensure_ascii=False, separators=(",", ":")))
+        return api_error("project_not_found", f"No managed project named or located at {args.app_dir}")
+    api_print(**setup_status_record(entry))
+    return 0
+
+
+def cmd_api_store_versions(args) -> int:
+    """Report the version numbers the two stores already hold. Reads nothing else.
+
+    Read-only end to end: it starts one fastlane lane that lists what Play and
+    App Store Connect hold and writes nothing anywhere. Every failure below
+    answers with the same error envelope the sibling document commands use, and
+    never with a half-built report — "Play holds no version code" and "Play was
+    never asked" have to stay distinguishable, and the only way to guarantee
+    that on this side is to withhold the platform objects entirely when the lane
+    did not answer. A client that sees `error` knows nothing was checked; a
+    client that sees `android`/`ios` gets the lane's own per-platform status.
+    """
+    entry = api_find_project(args.app_dir)
+    if not entry:
+        return api_error("project_not_found", f"No managed project named or located at {args.app_dir}")
+    app = Path(entry.get("path", "")).expanduser()
+    if not app.is_dir():
+        return api_error(
+            "project_unavailable",
+            f"The managed project directory is missing: {app}",
+        )
+    if not is_onboarded(app):
+        return api_error(
+            "project_not_onboarded",
+            f"{app} has no shared Fastfile importer or release configuration; "
+            "run `frk onboard` before asking the stores",
+        )
+    if not fastlane_installed():
+        return api_error(
+            "fastlane_unavailable",
+            "fastlane is not installed — run `brew install fastlane`",
+        )
+
+    try:
+        code, output = capture_fastlane(
+            app, ["store_versions"], timeout=STORE_VERSIONS_TIMEOUT_SECONDS
+        )
+    except subprocess.TimeoutExpired:
+        # "did not finish within", not "made no progress for": the budget is a
+        # total wall-clock deadline (see STORE_VERSIONS_TIMEOUT_SECONDS), and a
+        # cold bundler plus two slow store round-trips can chatter continuously
+        # for the whole 300 seconds and still land here. Telling that user the
+        # lane stalled sends them looking for a hang that did not happen.
+        return api_error(
+            "store_query_timed_out",
+            f"`fastlane store_versions` did not finish within {STORE_VERSIONS_TIMEOUT_SECONDS} "
+            "seconds and was stopped; no store version was read",
+        )
+    except OSError as exc:
+        return api_error(
+            "fastlane_unavailable",
+            f"could not start fastlane: {exc.strerror or exc}",
+        )
+
+    marker = store_versions_marker_payload(output)
+    if marker is None:
+        # No marker covers three failures that look the same from here: fastlane
+        # crashed, the lane is missing from an older shared Fastfile, or the run
+        # died before the lane could report. The child's output is deliberately
+        # not quoted — it is unbounded, unredacted, and this document gets
+        # logged. The sentence points at the command that shows it instead.
+        return api_error(
+            "store_query_failed",
+            f"`fastlane store_versions` exited with status {code} without reporting store "
+            f"versions; run it in {app} to see the output",
+        )
+    try:
+        report = json.loads(marker)
+    except ValueError:
+        report = None
+    if not isinstance(report, dict):
+        return api_error(
+            "store_report_unreadable",
+            "`fastlane store_versions` reported a line this CLI cannot read as a JSON object; "
+            "the lane and the CLI disagree about the report format",
+        )
+
+    # A non-zero exit with a complete report is not a failure of the question:
+    # the lane never raises and always emits the marker, each platform carries
+    # its own status, and a fastlane wrapper that exits non-zero afterwards must
+    # not turn a full answer into "could not check".
+    configured_name, _ = config_summary(app)
+    api_print(
+        # The project name comes from this side, not from the report. It is one
+        # less field the lane can put anything into.
+        project=configured_name or entry.get("name") or app.name,
+        checkedAt=store_versions_checked_at(report),
+        android=store_versions_android(report.get("android")),
+        ios=store_versions_ios(report.get("ios")),
+    )
+    return 0
+
+
+def api_find_project_dir(value: str) -> tuple[dict, Path] | tuple[None, None]:
+    """`api_find_project` plus the one check every build-args command needs
+    right after it: that the registered path still exists on disk."""
+    entry = api_find_project(value)
+    if not entry:
+        return None, None
+    app = Path(entry.get("path", "")).expanduser()
+    if not app.is_dir():
+        return entry, None
+    return entry, app
+
+
+def cmd_api_build_args(args) -> int:
+    entry, app = api_find_project_dir(args.app_dir)
+    if not entry:
+        return api_error("project_not_found", f"No managed project named or located at {args.app_dir}")
+    if not app:
+        return api_error("project_unavailable", f"The managed project directory is missing: {entry.get('path')}")
+    _, platforms = config_summary(app)
+    api_print(**build_args_record(app, platforms))
+    return 0
+
+
+def cmd_api_set_build_args(args) -> int:
+    entry, app = api_find_project_dir(args.app_dir)
+    if not entry:
+        return api_error("project_not_found", f"No managed project named or located at {args.app_dir}")
+    if not app:
+        return api_error("project_unavailable", f"The managed project directory is missing: {entry.get('path')}")
+    _, platforms = config_summary(app)
+    if args.platform not in platforms:
+        return api_error(
+            "invalid_platform",
+            f"{entry.get('name') or app.name} is not configured for {args.platform}",
+        )
+    set_platform_extra_build_args(app, args.platform, args.arg)
+    api_print(**build_args_record(app, platforms))
     return 0
 
 
 def cmd_api_credentials(args) -> int:
-    print(json.dumps(api_document(**credential_status_record()),
-                     ensure_ascii=False, separators=(",", ":")))
+    api_print(**credential_status_record())
     return 0
 
 
@@ -1609,12 +2470,14 @@ def cmd_api_configure_credentials(args) -> int:
                 force=args.force,
             )
     except ValueError as exc:
-        print(json.dumps(api_document(error={
-            "code": "invalid_credentials",
-            "message": str(exc),
-        }), ensure_ascii=False, separators=(",", ":")))
-        return 1
-    print(json.dumps(api_document(**status), ensure_ascii=False, separators=(",", ":")))
+        return api_error("invalid_credentials", str(exc))
+    except OSError as exc:
+        # A read-only or missing vault is not a bad credential — the file the
+        # user chose is fine and the machine is not. Distinct code so a client
+        # can tell "pick another file" from "fix the vault".
+        detail = f"{exc.strerror}: {exc.filename}" if exc.filename else str(exc)
+        return api_error("credential_vault_unavailable", detail)
+    api_print(**status)
     return 0
 
 
@@ -1626,7 +2489,7 @@ def require_api_value(value: str | None, label: str) -> str:
 
 def api_action_command(args) -> list[str]:
     """Map the stable protocol to the current human CLI. Keep this map backwards compatible."""
-    frk = [sys.executable, str(Path(__file__).resolve())]
+    frk = [sys.executable, str(CLI_ENTRYPOINT)]
     action = args.action
     app = args.app_dir
 
@@ -1706,13 +2569,18 @@ def cmd_api_run(args) -> int:
     environment = os.environ.copy()
     environment["FASTLANE_DISABLE_COLORS"] = "1"
     environment["TERM"] = "dumb"
+    # No cwd: `frk api run doctor .` has to mean the same directory as
+    # `frk doctor .`, so the child inherits the caller's. Nothing in it needs
+    # the kit checkout — KIT_ROOT and CLI_ENTRYPOINT are absolute, and
+    # run_fastlane passes cwd=app itself.
     process = subprocess.Popen(
         command,
-        cwd=KIT_ROOT,
         env=environment,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
         start_new_session=True,
     )
@@ -1736,6 +2604,31 @@ def cmd_api_run(args) -> int:
             sequence += 1
             api_emit("log", action=args.action, sequence=sequence, stream="combined", message=message)
         code = process.wait()
+    except BaseException as exc:
+        # The child is detached with start_new_session, so nothing else will
+        # ever stop it, and the client blocks until it sees a terminal event.
+        # Reap the group and report, rather than leaving an orphan behind an
+        # unanswered `started`. `code` is unbound here: do not reference it.
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except OSError:
+                pass
+        process.wait()
+        api_emit(
+            "error",
+            action=args.action,
+            code="stream_failed",
+            message=f"{type(exc).__name__}: {exc}",
+        )
+        api_emit(
+            "finished",
+            action=args.action,
+            success=False,
+            exitCode=API_INTERNAL_EXIT,
+            durationSeconds=round(time.monotonic() - started, 3),
+        )
+        return API_INTERNAL_EXIT
     finally:
         signal.signal(signal.SIGTERM, previous_term)
         signal.signal(signal.SIGINT, previous_int)
@@ -1752,23 +2645,8 @@ def cmd_api_run(args) -> int:
     return code
 
 
-def cmd_forget(args) -> int:
-    app = resolve_app(args.app_dir)
-    data = load_registry()
-    before = len(data["projects"])
-    data["projects"] = [
-        p for p in data["projects"]
-        if Path(p.get("path", "")).expanduser().resolve() != app
-    ]
-    if len(data["projects"]) == before:
-        die(f"{app} is not in the managed-project registry")
-    save_registry(data)
-    ok(f"forgot {app}; no project files were changed")
-    return 0
-
-
 # --------------------------------------------------------------------------- #
-# Android upload-key vault
+# Android upload-key vault and Git-exposure checks
 # --------------------------------------------------------------------------- #
 def _unescape_java_property(value: str) -> str:
     """Decode the escapes understood by java.util.Properties.load."""
@@ -1800,6 +2678,12 @@ def read_properties(path: Path) -> dict[str, str]:
     logical_lines = []
     pending = ""
     for physical in read(path).splitlines():
+        # java.util.Properties classifies a natural line as a comment before it
+        # applies line continuation, so a comment ending in a backslash (a bare
+        # Windows path, say) must not swallow the property line after it.
+        if not pending and physical.lstrip()[:1] in ("#", "!"):
+            logical_lines.append(physical)
+            continue
         line = pending + (physical.lstrip() if pending else physical)
         trailing_slashes = len(line) - len(line.rstrip("\\"))
         if trailing_slashes % 2 == 1:
@@ -1876,6 +2760,13 @@ def resolve_store_file(
 
 
 def find_keytool() -> str | None:
+    """Locate a usable keytool, at most once per process.
+
+    `frk api projects` asks every managed Android app for its signing status, and
+    the JDK does not move between those questions.
+    """
+    if find_keytool.cache is not None:
+        return find_keytool.cache[0]
     candidates = []
     java_home = os.environ.get("JAVA_HOME", "").strip()
     if java_home:
@@ -1888,17 +2779,34 @@ def find_keytool() -> str | None:
     if discovered:
         candidates.append(Path(discovered))
 
+    found = None
     for candidate in dict.fromkeys(path.resolve() for path in candidates):
         if not candidate.is_file() or not os.access(candidate, os.X_OK):
             continue
-        probe = subprocess.run(
-            [str(candidate), "-help"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        try:
+            probe = subprocess.run(
+                [str(candidate), "-help"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=20,
+            )
+        except subprocess.TimeoutExpired:
+            # A candidate that will not even answer -help is not a usable
+            # keytool. Silent by contract: this helper returns a path or None
+            # and has never printed anything.
+            continue
         if probe.returncode == 0:
-            return str(candidate)
-    return None
+            found = str(candidate)
+            break
+    find_keytool.cache = (found,)
+    return found
+
+
+# Mirrors distribution_identities.cache above: the memo hangs off the function so
+# whatever reaches the probe reaches its memo. None means "not looked up yet";
+# "looked up, found nothing" is the one-tuple (None,), so a machine without a JDK
+# is not re-probed once per project.
+find_keytool.cache = None
 
 
 def probe_keystore_file(store: Path, properties: dict[str, str]) -> dict:
@@ -1922,6 +2830,8 @@ def probe_keystore_file(store: Path, properties: dict[str, str]) -> dict:
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             env=environment,
             timeout=20,
         )
@@ -1982,12 +2892,14 @@ public class FRKKeyProbe {
     try:
         with tempfile.TemporaryDirectory(prefix="frk-key-probe-") as directory:
             probe = Path(directory) / "FRKKeyProbe.java"
-            probe.write_text(source)
+            probe.write_text(source, encoding="utf-8")
             probe.chmod(0o600)
             key_result = subprocess.run(
                 [str(java), str(probe)],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 env=environment,
                 timeout=20,
             )
@@ -2025,32 +2937,84 @@ def validate_keystore_file(store: Path, properties: dict[str, str]) -> str | Non
     return result["fingerprint"]
 
 
+# The four helpers below are a security guard, and a guard has to fail CLOSED.
+# Each returns a bool, which has no room for "I could not check", so on timeout
+# each returns the answer that makes its caller WARN and records the fact here.
+# Callers read the flag to phrase that warning as "the check did not finish"
+# instead of asserting an exposure nobody observed — the fail-closed value is a
+# placeholder, not a finding.
+def begin_git_checks() -> None:
+    """Start a fresh group of Git checks; call before the first helper."""
+    git_check_timed_out.flag = False
+
+
+def note_git_check_timeout() -> None:
+    git_check_timed_out.flag = True
+
+
+def git_check_timed_out() -> bool:
+    """True when a helper in the current group ran out of time."""
+    return git_check_timed_out.flag
+
+
+# Kept on the function for the same reason as distribution_identities.cache: a
+# caller that reaches the predicate reaches its state too.
+git_check_timed_out.flag = False
+
+GIT_CHECK_TIMEOUT_DETAIL = (
+    f"Git exposure could not be verified: git did not answer within {GIT_TIMEOUT_SECONDS}s. "
+    "The signing files are treated as exposed until the check completes."
+)
+
+
 def git_tracks(app: Path, relative: str) -> bool:
     if not shutil.which("git"):
         return False
-    result = subprocess.run(
-        ["git", "-C", str(app), "ls-files", "--error-unmatch", relative],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    try:
+        result = subprocess.run(
+            # `--` or a keystore whose name starts with a dash is read as an
+            # option, and this guard would answer "not tracked" for a committed
+            # secret.
+            ["git", "-C", str(app), "ls-files", "--error-unmatch", "--", relative],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        # "Not tracked" is the reassuring answer, so it is the wrong one here: a
+        # stalled git would silently clear a committed keystore.
+        note_git_check_timeout()
+        return True
     return result.returncode == 0
 
 
 def git_ignores(app: Path, relative: str) -> bool:
     if not shutil.which("git"):
         return True
-    repo = subprocess.run(
-        ["git", "-C", str(app), "rev-parse", "--show-toplevel"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    try:
+        repo = subprocess.run(
+            ["git", "-C", str(app), "rev-parse", "--show-toplevel"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        # Whether this is even a repository is now unknown, so the "outside a
+        # repository, nothing to ignore" shortcut below cannot be claimed.
+        note_git_check_timeout()
+        return False
     if repo.returncode:
         return True
-    result = subprocess.run(
-        ["git", "-C", str(app), "check-ignore", "--no-index", "-q", "--", relative],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(app), "check-ignore", "--no-index", "-q", "--", relative],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        note_git_check_timeout()
+        return False
     return result.returncode == 0
 
 
@@ -2058,11 +3022,19 @@ def git_path_is_ignored_or_external(path: Path) -> bool:
     """Outside a repository is safe; inside one must have an ignore rule."""
     if not shutil.which("git"):
         return True
-    root_result = subprocess.run(
-        ["git", "-C", str(path.parent), "rev-parse", "--show-toplevel"],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        root_result = subprocess.run(
+            ["git", "-C", str(path.parent), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        # "Safe" is the reassuring answer, so it is the wrong one on a timeout.
+        note_git_check_timeout()
+        return False
     if root_result.returncode:
         return True
     root = Path(root_result.stdout.strip()).resolve()
@@ -2076,11 +3048,19 @@ def git_path_is_ignored_or_external(path: Path) -> bool:
 def git_tracks_path(path: Path) -> bool:
     if not shutil.which("git") or not path.exists():
         return False
-    root_result = subprocess.run(
-        ["git", "-C", str(path.parent), "rev-parse", "--show-toplevel"],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        root_result = subprocess.run(
+            ["git", "-C", str(path.parent), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        # Same direction as git_tracks: assume the secret may be committed.
+        note_git_check_timeout()
+        return True
     if root_result.returncode:
         return False
     root = Path(root_result.stdout.strip()).resolve()
@@ -2091,6 +3071,9 @@ def git_tracks_path(path: Path) -> bool:
     return git_tracks(root, relative)
 
 
+# --------------------------------------------------------------------------- #
+# signing commands
+# --------------------------------------------------------------------------- #
 def cmd_signing_audit(args) -> int:
     app = require_managed_app(args.app_dir)
     _, platforms = config_summary(app)
@@ -2100,12 +3083,16 @@ def cmd_signing_audit(args) -> int:
 
     package = signing_package(app)
     props_path = app / "android" / "key.properties"
-    vault = SIGNING_DIR / package
+    vault = signing_dir() / package
     head(f"Android signing — {package}")
     info(f"project     {app}")
     info(f"vault       {vault}")
 
     status = android_setup_record(app, package)
+    # android_setup_record ran the Git checks as one group and nothing has run
+    # a git command since, so the group flag still describes them. The record's
+    # four Git booleans are fail-closed placeholders when this is True.
+    git_checked = not git_check_timed_out()
     problems = []
     if not status["projectPropertiesExists"]:
         problems.append("android/key.properties is missing")
@@ -2134,16 +3121,23 @@ def cmd_signing_audit(args) -> int:
     else:
         problems.append(f"Gradle signing: {status['gradleConfigurationDetail']}")
 
-    if status["gitTracked"]:
-        problems.append("android/key.properties is tracked by Git — remove it from the index")
-    if status["keystoreGitTracked"]:
-        problems.append("the upload keystore is tracked by Git — remove it from the index and rotate it if pushed")
-    if not status["propertiesGitIgnored"]:
-        problems.append("android/key.properties is not protected by a .gitignore rule")
-    if not status["keystoreGitIgnored"]:
-        problems.append("the upload keystore is inside the repository but is not ignored")
-    if status["gitSafe"]:
-        ok("signing secrets are not tracked by Git")
+    if not git_checked:
+        # Still a problem — the guard did not pass — but it is reported as an
+        # unfinished check, not as a leak. Printing the fail-closed booleans
+        # here would send the user chasing an exposure that may not exist.
+        # Same reasoning as the "tool unavailable" sentence below.
+        problems.append(GIT_CHECK_TIMEOUT_DETAIL)
+    else:
+        if status["gitTracked"]:
+            problems.append("android/key.properties is tracked by Git — remove it from the index")
+        if status["keystoreGitTracked"]:
+            problems.append("the upload keystore is tracked by Git — remove it from the index and rotate it if pushed")
+        if not status["propertiesGitIgnored"]:
+            problems.append("android/key.properties is not protected by a .gitignore rule")
+        if not status["keystoreGitIgnored"]:
+            problems.append("the upload keystore is inside the repository but is not ignored")
+        if status["gitSafe"]:
+            ok("signing secrets are not tracked by Git")
 
     if status["projectLinked"] and status["vaultReady"]:
         ok("project uses the protected central signing entry")
@@ -2196,9 +3190,10 @@ def cmd_signing_import(args) -> int:
         die(f"keystore referenced by {source_props} was not found: {source_store}")
     fingerprint = validate_keystore_file(source_store, props)
 
-    vault = SIGNING_DIR / package
-    ensure_private_dir(CREDENTIALS_DIR)
-    ensure_private_dir(SIGNING_DIR)
+    signing = signing_dir()
+    vault = signing / package
+    ensure_private_dir(credentials_dir())
+    ensure_private_dir(signing)
     ensure_private_dir(vault)
     suffix = source_store.suffix if source_store.suffix in (".jks", ".keystore") else ".jks"
     target_store = vault / f"upload-keystore{suffix}"
@@ -2207,28 +3202,54 @@ def cmd_signing_import(args) -> int:
     if target_store.exists() and target_store.read_bytes() != source_store.read_bytes() and not args.force:
         die(f"a different keystore already exists at {target_store}; inspect it or use --force")
 
-    source_content = source_props.read_text()
+    source_content = source_props.read_text(encoding="utf-8")
+    # read_properties above — like java.util.Properties — accepts `=`, `:` or
+    # bare whitespace as the separator, so the rewrite has to accept all three:
+    # matching only `=` rejected a file keytool had just validated. The runs are
+    # [ \t] rather than \s because \s matches the newline, which let `^\s*` eat a
+    # preceding blank line out of the vault copy.
     target_content, replacements = re.subn(
-        r"(?m)^\s*storeFile\s*=.*$",
+        r"(?m)^[ \t]*storeFile(?:[ \t]*[=:]|[ \t])[ \t]*.*$",
         f"storeFile={target_store.as_posix()}",
         source_content,
     )
     if replacements == 0:
         die(f"{source_props} has no replaceable storeFile entry")
+    # Normalise the other three too: fastlane/Fastfile's preflight reads only
+    # `key=value`, so a storeFile-only fix would just move the failure there.
+    # Only separators that preflight rejects are touched — a line that already
+    # has an `=` is left byte-for-byte alone, so a re-import of a file that
+    # works today still matches what is in the vault.
+    for signing_key in ANDROID_SIGNING_KEYS:
+        if signing_key == "storeFile":
+            continue
+        target_content = re.sub(
+            rf"(?m)^([ \t]*{re.escape(signing_key)})(?:[ \t]*:|[ \t]+(?![ \t]*[=:]))[ \t]*",
+            r"\1=",
+            target_content,
+        )
     if not target_content.endswith("\n"):
         target_content += "\n"
-    if target_props.exists() and target_props.read_text() != target_content and not args.force:
+    if target_props.exists() and target_props.read_text(encoding="utf-8") != target_content and not args.force:
         die(f"different signing properties already exist at {target_props}; inspect them or use --force")
 
     if not args.dry_run:
         shutil.copy2(source_store, target_store)
         target_store.chmod(0o600)
-        target_props.write_text(target_content)
+        target_props.write_text(target_content, encoding="utf-8")
         target_props.chmod(0o600)
 
     head(f"Import Android signing — {package}")
     ok(f"source preserved: {source_props}")
-    if git_tracks_path(source_props) or git_tracks_path(source_store):
+    begin_git_checks()
+    source_tracked = git_tracks_path(source_props) or git_tracks_path(source_store)
+    if git_check_timed_out():
+        warn(
+            "could not check whether the original signing file is tracked by Git "
+            f"(git did not answer within {GIT_TIMEOUT_SECONDS}s); run "
+            "`git ls-files` on it yourself before assuming it is safe"
+        )
+    elif source_tracked:
         warn(
             "the original signing file is tracked by Git; remove it from Git "
             "and rotate the upload key if it was pushed"
@@ -2244,6 +3265,18 @@ def cmd_signing_import(args) -> int:
     return 0
 
 
+def backup_signing_file(source: Path, team: str, filename: str) -> Path:
+    """Copies a file this command is about to regenerate or edit into the
+    vault's per-team backup folder first, so a mistake is one copy away from
+    undone."""
+    backup_dir = signing_dir() / "ios" / team / "backups"
+    ensure_private_dir(backup_dir)
+    backup = backup_dir / filename
+    shutil.copy2(source, backup)
+    backup.chmod(0o600)
+    return backup
+
+
 def cmd_signing_ios_setup(args) -> int:
     """Create/reuse Apple signing material through the shared Fastlane lane."""
     app = require_managed_app(args.app_dir)
@@ -2252,20 +3285,24 @@ def cmd_signing_ios_setup(args) -> int:
         die(f"{app.name} is not configured for iOS")
     bundle = config_setting(app, "bundle_id")
     team = config_setting(app, "team_id")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     export_path = app / "ios" / "ExportOptions.plist"
     export_status = ios_export_options_record(app, bundle, team)
     if not export_status["ready"]:
         if export_path.exists():
-            backup_dir = SIGNING_DIR / "ios" / team / "backups"
-            ensure_private_dir(backup_dir)
-            stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-            backup = backup_dir / f"{app.name}-ExportOptions-{stamp}.plist"
-            shutil.copy2(export_path, backup)
-            backup.chmod(0o600)
+            backup = backup_signing_file(export_path, team, f"{app.name}-ExportOptions-{stamp}.plist")
             ok(f"previous ExportOptions.plist backed up: {backup}")
         export_path.parent.mkdir(parents=True, exist_ok=True)
-        export_path.write_text(export_options_plist(team, bundle))
+        export_path.write_text(export_options_plist(team, bundle), encoding="utf-8")
         ok("generated app-specific ios/ExportOptions.plist")
+    # The lane also pins the Xcode project's Release configuration to manual
+    # signing with the profile it creates (see `setup_signing` in the shared
+    # Fastfile) — the one file this command touches that Xcode itself owns
+    # rather than one FRK generates, so it gets the same backup treatment.
+    pbxproj = app / "ios" / "Runner.xcodeproj" / "project.pbxproj"
+    if pbxproj.is_file():
+        backup = backup_signing_file(pbxproj, team, f"{app.name}-project.pbxproj-{stamp}")
+        ok(f"previous project.pbxproj backed up: {backup}")
     return run_fastlane(app, ["ios", "setup_signing"], prevent_sleep=True)
 
 
@@ -2273,7 +3310,7 @@ def cmd_signing_link(args) -> int:
     """Point one project's ignored key.properties at its central vault entry."""
     app = require_managed_app(args.app_dir)
     package = signing_package(app)
-    vault = SIGNING_DIR / package
+    vault = signing_dir() / package
     target_props = vault / "key.properties"
     target_store = resolve_store_file(target_props, read_properties(target_props)) if target_props.is_file() else None
     if not target_props.is_file() or not target_store or not target_store.is_file():
@@ -2289,7 +3326,7 @@ def cmd_signing_link(args) -> int:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         backup = vault / "backups" / f"{stamp}-project-key.properties"
         if project_props.is_symlink():
-            backup.write_text(f"symlink={os.readlink(project_props)}\n")
+            backup.write_text(f"symlink={os.readlink(project_props)}\n", encoding="utf-8")
         else:
             shutil.copy2(project_props, backup)
         backup.chmod(0o600)
@@ -2299,42 +3336,100 @@ def cmd_signing_link(args) -> int:
     project_props.parent.mkdir(parents=True, exist_ok=True)
     project_props.symlink_to(target_props)
     ok(f"linked: {project_props} -> {target_props}")
-    if git_tracks(app, "android/key.properties"):
+    begin_git_checks()
+    project_tracked = git_tracks(app, "android/key.properties")
+    if git_check_timed_out():
+        warn(
+            "could not check whether android/key.properties is tracked by Git "
+            f"(git did not answer within {GIT_TIMEOUT_SECONDS}s); run "
+            "`git ls-files android/key.properties` yourself"
+        )
+    elif project_tracked:
         warn("this path is tracked by Git; run `git rm --cached android/key.properties` and commit the removal")
     return 0
 
 
+def build_args_record(app: Path, platforms: list[str]) -> dict:
+    """Shared and per-platform extra `flutter build` flags, plus what each
+    configured platform's build actually receives once the two are combined.
+    A platform not in `platforms` reports empty rather than reading a section
+    that may not exist."""
+    shared = shared_extra_build_args(app)
+    record = {"shared": shared}
+    for platform in ("android", "ios"):
+        configured = platform in platforms
+        own = platform_extra_build_args(app, platform) if configured else []
+        record[platform] = {
+            "configured": configured,
+            "own": own,
+            "effective": shared + own if configured else [],
+        }
+    return record
+
+
+def format_arg_list(values: list[str]) -> str:
+    return ", ".join(values) if values else "(none)"
+
+
+def cmd_build_args_show(args) -> int:
+    """Print each platform's shared, own, and effective extra build flags."""
+    app = require_managed_app(args.app_dir)
+    _, platforms = config_summary(app)
+    record = build_args_record(app, platforms)
+    head(f"{app.name}: extra build flags")
+    info(f"shared (every configured platform): {format_arg_list(record['shared'])}")
+    for platform in ("android", "ios"):
+        if not record[platform]["configured"]:
+            continue
+        info(f"{platform} only:      {format_arg_list(record[platform]['own'])}")
+        info(f"{platform} effective: {format_arg_list(record[platform]['effective'])}")
+    return 0
+
+
+def cmd_build_args_set(args) -> int:
+    """Replace one platform's own extra build flags; an empty --arg list clears them."""
+    app = require_managed_app(args.app_dir)
+    _, platforms = config_summary(app)
+    if args.platform not in platforms:
+        die(f"{app.name} is not configured for {args.platform}")
+    set_platform_extra_build_args(app, args.platform, args.arg)
+    if args.arg:
+        ok(f"{args.platform}.extra_build_args set to: {format_arg_list(args.arg)}")
+    else:
+        ok(f"{args.platform}.extra_build_args cleared")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# machine setup and status commands
+# --------------------------------------------------------------------------- #
 def cmd_setup(args) -> int:
     """Prepare the local, non-secret parts of the toolkit idempotently."""
     head("Machine setup")
 
-    for directory in (
-        CREDENTIALS_DIR,
-        CREDENTIALS_DIR / "asc",
-        CREDENTIALS_DIR / "play",
-        SIGNING_DIR,
-    ):
-        ensure_private_dir(directory)
-    ok(f"private vault: {CREDENTIALS_DIR} (mode 700)")
+    vault = credentials_dir()
+    env_file = vault / "credentials.env"
+    kept = env_file.exists()
+    # The vault line is reported even when the credentials file turns out to be
+    # unusable, because by then the directories really have been created.
+    refused = None
+    try:
+        ensure_credential_vault(include_signing=True)
+    except ValueError as exc:
+        refused = exc
+    ok(f"private vault: {vault} (mode 700)")
+    if refused:
+        die(str(refused))
+    ok(f"credentials template: {env_file}{' (kept existing file)' if kept else ''}")
 
-    env_file = CREDENTIALS_DIR / "credentials.env"
-    if env_file.exists():
-        if not env_file.is_file():
-            die(f"credentials path is not a file: {env_file}")
-        env_file.chmod(0o600)
-        ok(f"credentials template: {env_file} (kept existing file)")
-    else:
-        env_file.write_text(CREDENTIALS_ENV_TEMPLATE)
-        env_file.chmod(0o600)
-        ok(f"credentials template: {env_file}")
-
-    if REGISTRY_PATH.exists():
+    registry = registry_path()
+    if registry.exists():
         load_registry()
-        REGISTRY_PATH.chmod(0o600)
-        ok(f"project registry: {REGISTRY_PATH} (kept existing entries)")
+        registry.chmod(0o600)
+        ok(f"project registry: {registry} (kept existing entries)")
     else:
         save_registry({"version": REGISTRY_VERSION, "projects": []})
-        ok(f"project registry: {REGISTRY_PATH}")
+        ok(f"project registry: {registry}")
 
     bin_dir = (
         Path(args.bin_dir).expanduser().resolve()
@@ -2343,7 +3438,7 @@ def cmd_setup(args) -> int:
     )
     bin_dir.mkdir(parents=True, exist_ok=True)
     command = bin_dir / "frk"
-    target = KIT_ROOT / "bin" / "frk"
+    target = CLI_ENTRYPOINT
     link_ready = False
     if command.is_symlink() and command.resolve() == target.resolve():
         ok(f"command already installed: {command}")
@@ -2395,19 +3490,21 @@ def cmd_status(args) -> int:
     info(f"version     {VERSION}")
     info(f"root        {KIT_ROOT}")
     fastfile = KIT_ROOT / "fastlane" / "Fastfile"
-    (ok if fastfile.is_file() else fail)(f"shared Fastfile ({sum(1 for _ in open(fastfile))} lines)"
+    (ok if fastfile.is_file() else fail)(f"shared Fastfile ({sum(1 for _ in open(fastfile, encoding='utf-8'))} lines)"
                                          if fastfile.is_file() else "shared Fastfile MISSING")
 
     head("Shared credentials")
-    info(f"dir         {CREDENTIALS_DIR}")
-    if not CREDENTIALS_DIR.is_dir():
+    vault = credentials_dir()
+    signing = signing_dir()
+    info(f"dir         {vault}")
+    if not vault.is_dir():
         fail("directory does not exist — see docs/ONBOARDING.md")
         return 1
 
-    mode = oct(CREDENTIALS_DIR.stat().st_mode)[-3:]
+    mode = oct(vault.stat().st_mode)[-3:]
     (ok if mode == "700" else warn)(f"permissions {mode}" + ("" if mode == "700" else " (expected 700)"))
 
-    for private_dir in (CREDENTIALS_DIR / "asc", CREDENTIALS_DIR / "play", SIGNING_DIR):
+    for private_dir in (vault / "asc", vault / "play", signing):
         if private_dir.is_dir():
             child_mode = private_dir.stat().st_mode & 0o777
             (ok if child_mode == 0o700 else warn)(
@@ -2415,10 +3512,11 @@ def cmd_status(args) -> int:
                 + ("" if child_mode == 0o700 else " (expected 700)")
             )
 
-    env_file = CREDENTIALS_DIR / "credentials.env"
+    env_file = vault / "credentials.env"
     if env_file.is_file():
-        keys = [l.split("=")[0].strip() for l in read(env_file).splitlines()
-                if l.strip() and not l.strip().startswith("#") and "=" in l]
+        # Deliberately not env_values(): this line reports the file as written,
+        # so a key set twice has to appear twice for the user to spot it.
+        keys = [key for key, _ in env_pairs(env_file)]
         if keys:
             ok(f"credentials.env — sets {', '.join(keys)}")
         else:
@@ -2426,12 +3524,13 @@ def cmd_status(args) -> int:
     else:
         fail("credentials.env missing")
 
-    sensitive_files = [env_file, REGISTRY_PATH]
-    sensitive_files += list((CREDENTIALS_DIR / "asc").glob("*.p8"))
-    sensitive_files += list((CREDENTIALS_DIR / "play").glob("*.json"))
-    sensitive_files += list(SIGNING_DIR.glob("**/key.properties"))
-    sensitive_files += list(SIGNING_DIR.glob("**/*.jks"))
-    sensitive_files += list(SIGNING_DIR.glob("**/*.keystore"))
+    registry = registry_path()
+    sensitive_files = [env_file, registry]
+    sensitive_files += list((vault / "asc").glob("*.p8"))
+    sensitive_files += list((vault / "play").glob("*.json"))
+    sensitive_files += list(signing.glob("**/key.properties"))
+    sensitive_files += list(signing.glob("**/*.jks"))
+    sensitive_files += list(signing.glob("**/*.keystore"))
     loose = [path for path in sensitive_files if path.is_file() and path.stat().st_mode & 0o077]
     if loose:
         for path in loose:
@@ -2439,27 +3538,37 @@ def cmd_status(args) -> int:
     else:
         ok("sensitive files are private (no group/world access)")
 
-    p8s = list((CREDENTIALS_DIR / "asc").glob("AuthKey_*.p8"))
+    p8s = list((vault / "asc").glob("AuthKey_*.p8"))
     (ok if p8s else warn)(f"App Store Connect keys: {len(p8s)}"
                           + (f" ({', '.join(p.name for p in p8s)})" if p8s else " — iOS uploads will fail"))
 
-    plays = list((CREDENTIALS_DIR / "play").glob("*.json"))
+    plays = list((vault / "play").glob("*.json"))
     (ok if plays else warn)(
         f"Play service accounts: {len(plays)}"
         + (f" ({', '.join(p.name for p in plays)})" if plays else " — Android uploads will fail")
     )
 
     projects = managed_projects()
-    ok(f"managed projects: {len(projects)} (opt-in registry: {REGISTRY_PATH})")
-    signing_entries = list(SIGNING_DIR.glob("*/key.properties")) if SIGNING_DIR.is_dir() else []
+    ok(f"managed projects: {len(projects)} (opt-in registry: {registry})")
+    signing_entries = list(signing.glob("*/key.properties")) if signing.is_dir() else []
     (ok if signing_entries else warn)(f"central Android signing entries: {len(signing_entries)}")
 
     head("Signing identities (account-level, shared by all iOS apps)")
+    unavailable = "macOS `security` command unavailable — iOS signing cannot be checked on this machine"
     if shutil.which("security") is None:
-        warn("macOS `security` command unavailable — iOS signing cannot be checked on this machine")
+        warn(unavailable)
         return 0
-    out = subprocess.run(["security", "find-identity", "-v", "-p", "codesigning"],
-                         capture_output=True, text=True).stdout
+    try:
+        out = subprocess.run(["security", "find-identity", "-v", "-p", "codesigning"],
+                             capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=20).stdout
+    except subprocess.TimeoutExpired:
+        # A wedged keychain is the same thing as an absent tool for this
+        # listing, so it reuses that sentence rather than inventing one — and
+        # never claims "no Apple Distribution identity", which would send the
+        # user off to mint a duplicate certificate.
+        warn(unavailable)
+        return 0
     names = re.findall(r'"([^"]+)"', out)
     if any("Distribution" in n for n in names):
         for n in names:
@@ -2470,7 +3579,11 @@ def cmd_status(args) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# command-line entry point
+# --------------------------------------------------------------------------- #
 def main() -> int:
+    configure_stdout_encoding()
     p = argparse.ArgumentParser(prog="frk", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--version", action="version", version=f"frk {VERSION}")
@@ -2537,24 +3650,24 @@ def main() -> int:
     api_sub = api.add_subparsers(dest="api_cmd", required=True)
 
     api_cap = api_sub.add_parser("capabilities", help="print protocol and feature information as JSON")
-    api_cap.set_defaults(func=cmd_api_capabilities)
+    api_cap.set_defaults(func=cmd_api_capabilities, api_document_command=True)
 
     api_projects = api_sub.add_parser("projects", help="print managed project summaries as JSON")
-    api_projects.set_defaults(func=cmd_api_projects)
+    api_projects.set_defaults(func=cmd_api_projects, api_document_command=True)
 
     api_project = api_sub.add_parser("project", help="print one managed project as JSON")
     api_project.add_argument("app_dir", help="path or managed app name")
-    api_project.set_defaults(func=cmd_api_project)
+    api_project.set_defaults(func=cmd_api_project, api_document_command=True)
 
     api_setup = api_sub.add_parser("setup", help="print structured release-setup diagnostics as JSON")
     api_setup.add_argument("app_dir", help="path or managed app name")
-    api_setup.set_defaults(func=cmd_api_setup)
+    api_setup.set_defaults(func=cmd_api_setup, api_document_command=True)
 
     api_credentials = api_sub.add_parser(
         "credentials",
         help="print shared store-credential readiness without secret values",
     )
-    api_credentials.set_defaults(func=cmd_api_credentials)
+    api_credentials.set_defaults(func=cmd_api_credentials, api_document_command=True)
 
     api_configure = api_sub.add_parser(
         "configure-credentials",
@@ -2565,17 +3678,36 @@ def main() -> int:
     api_configure.add_argument("--key-id", help="App Store Connect key id")
     api_configure.add_argument("--issuer-id", help="App Store Connect issuer id")
     api_configure.add_argument("--force", action="store_true", help="replace a different vault copy")
-    api_configure.set_defaults(func=cmd_api_configure_credentials)
+    api_configure.set_defaults(func=cmd_api_configure_credentials, api_document_command=True)
+
+    api_store_versions = api_sub.add_parser(
+        "store-versions",
+        help="read the version numbers Play and App Store Connect already hold",
+    )
+    api_store_versions.add_argument("app_dir", help="path or managed app name")
+    api_store_versions.set_defaults(func=cmd_api_store_versions, api_document_command=True)
+
+    api_build_args = api_sub.add_parser(
+        "build-args",
+        help="read each platform's shared, own, and effective extra flutter build flags",
+    )
+    api_build_args.add_argument("app_dir", help="path or managed app name")
+    api_build_args.set_defaults(func=cmd_api_build_args, api_document_command=True)
+
+    api_set_build_args = api_sub.add_parser(
+        "set-build-args",
+        help="replace one platform's own extra flutter build flags",
+    )
+    api_set_build_args.add_argument("app_dir", help="path or managed app name")
+    api_set_build_args.add_argument("--platform", required=True, choices=["android", "ios"])
+    api_set_build_args.add_argument(
+        "--arg", action="append", default=[],
+        help="one flag, e.g. --dart-define=KEY=value; repeat for more; omit entirely to clear",
+    )
+    api_set_build_args.set_defaults(func=cmd_api_set_build_args, api_document_command=True)
 
     api_run = api_sub.add_parser("run", help="run one stable action and stream JSON Lines events")
-    api_run.add_argument(
-        "action",
-        choices=[
-            "onboard", "doctor", "verify", "build", "validate",
-            "release", "signing-audit", "signing-import", "signing-link",
-            "ios-setup-signing", "status", "forget",
-        ],
-    )
+    api_run.add_argument("action", choices=list(API_RUN_ACTIONS))
     api_run.add_argument("app_dir", nargs="?", help="path or managed app name")
     api_run.add_argument("--platform", choices=["android", "ios", "all"])
     api_run.add_argument("--build-name")
@@ -2593,7 +3725,7 @@ def main() -> int:
     api_run.add_argument("--force", action="store_true", help="signing-import: replace a different vault copy")
     api_run.add_argument("--link", action="store_true", help="signing-import: link the project after copying")
     api_run.add_argument("--dry-run", action="store_true", help="onboard preview only")
-    api_run.set_defaults(func=cmd_api_run)
+    api_run.set_defaults(func=cmd_api_run, api_stream_command=True)
 
     sg = sub.add_parser("signing", help="manage central Android upload keys")
     sg_sub = sg.add_subparsers(dest="signing_cmd", required=True)
@@ -2622,8 +3754,49 @@ def main() -> int:
     ios_setup.add_argument("app_dir", nargs="?", default=".", help="path or managed app name")
     ios_setup.set_defaults(func=cmd_signing_ios_setup)
 
+    bg = sub.add_parser("build-args", help="view or set extra flutter build flags per platform")
+    bg_sub = bg.add_subparsers(dest="build_args_cmd", required=True)
+
+    bg_show = bg_sub.add_parser("show", help="print each platform's shared, own, and effective extra build flags")
+    bg_show.add_argument("app_dir", nargs="?", default=".", help="path or managed app name")
+    bg_show.set_defaults(func=cmd_build_args_show)
+
+    bg_set = bg_sub.add_parser("set", help="replace one platform's own extra build flags")
+    bg_set.add_argument("app_dir", nargs="?", default=".", help="path or managed app name")
+    bg_set.add_argument("--platform", required=True, choices=["android", "ios"])
+    bg_set.add_argument(
+        "--arg", action="append", default=[],
+        help="one flag, e.g. --dart-define=KEY=value; repeat for more; omit entirely to clear",
+    )
+    bg_set.set_defaults(func=cmd_build_args_set)
+
     args = p.parse_args()
-    return args.func(args)
+    # Only the command body is wrapped: argparse's own usage errors keep their
+    # plain-text contract, and a human command keeps its stderr sentence.
+    try:
+        return args.func(args)
+    except SystemExit as exc:
+        status = exc.code if isinstance(exc.code, int) else 1
+        if not status:
+            raise
+        # die() already wrote the diagnostic to stderr; the document carries the
+        # fact and the exit code so a client is never left with zero bytes.
+        handled = api_failure_channel(
+            args,
+            "command_failed",
+            f"frk exited with status {status}; the diagnostic is on stderr",
+            status,
+        )
+        if handled is None:
+            raise
+        return handled
+    except Exception as exc:
+        handled = api_failure_channel(
+            args, "internal_error", f"{type(exc).__name__}: {exc}", API_INTERNAL_EXIT
+        )
+        if handled is None:
+            raise
+        return handled
 
 
 if __name__ == "__main__":

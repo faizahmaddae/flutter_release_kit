@@ -22,8 +22,10 @@
 require "shellwords"
 require "json"
 require "yaml"
+require "date" # Date/Time are permitted_classes in the release_kit.yml loader below
 require "fileutils"
 require "pathname"
+require "timeout" # store_versions caps each store probe; see the section at the end
 
 fastlane_version "2.220.0"
 opt_out_usage
@@ -52,11 +54,11 @@ SHARED_CREDENTIALS_DIR = File.expand_path(
 # invoked from inside another lane, because Ruby's `Kernel#test` shadows it.
 desc "Run the project's quality gate: flutter analyze + flutter test"
 lane :verify do
-  flutter("pub get")
+  flutter("pub", "get")
   # Many trees carry info-level lints, and `flutter analyze` exits 1 on those
   # unless infos are explicitly non-fatal. Gate on real errors, so a release is
   # never blocked by a style hint.
-  flutter("analyze --no-fatal-infos --no-fatal-warnings")
+  flutter("analyze", "--no-fatal-infos", "--no-fatal-warnings")
   flutter("test") if Dir.exist?(abs("test"))
 end
 
@@ -166,6 +168,14 @@ lane :release do |options|
   upload_all(options)
 end
 
+desc "Report what Google Play and App Store Connect already hold (read-only)"
+desc "Builds nothing, uploads nothing and changes nothing in either store."
+desc "Prints one machine-readable JSON line marked <<<FRK:STORE_VERSIONS:1>>>."
+desc "Options: timeout:60 (seconds allowed per store)"
+lane :store_versions do |options|
+  emit_store_versions_report(options)
+end
+
 # -----------------------------------------------------------------------------
 # Android
 # -----------------------------------------------------------------------------
@@ -178,11 +188,12 @@ platform :android do
 
     args = ["build", "appbundle", "--release"]
     args += ["--obfuscate", "--split-debug-info=#{SYMBOLS_DIR}"] if obfuscate?
+    args.concat(extra_build_args("android"))
     args.concat(version_args(options, "ANDROID"))
 
     preflight_android_signing
-    flutter("pub get")
-    flutter(args.join(" "))
+    flutter("pub", "get")
+    flutter(args)
 
     aab = newest(AAB_GLOB) or UI.user_error!("Build reported success but no .aab was found at #{AAB_GLOB}")
     UI.success("App Bundle: #{aab}")
@@ -332,10 +343,11 @@ platform :ios do
     preflight_ios_signing
 
     args = ["build", "ipa", "--release", "--export-options-plist=#{EXPORT_OPTIONS}"]
+    args.concat(extra_build_args("ios"))
     args.concat(version_args(options, "IOS"))
 
-    flutter("pub get")
-    flutter(args.join(" "))
+    flutter("pub", "get")
+    flutter(args)
 
     ipa = newest(IPA_GLOB) or UI.user_error!(
       "Build reported success but no .ipa was found at #{IPA_GLOB}. " \
@@ -470,7 +482,9 @@ platform :ios do
       output_path: signing_output_dir
     )
 
-    # The provisioning profile IS per app.
+    # The provisioning profile IS per app. `sigh` installs it into Xcode's own
+    # provisioning profile cache as a side effect (its default `skip_install`
+    # is false), which is what makes the next step able to find it by name.
     sigh(
       api_key: api_key,
       app_identifier: ios_bundle_id,
@@ -481,8 +495,30 @@ platform :ios do
       output_path: signing_output_dir
     )
 
+    # `cert`/`sigh` only reach Apple's servers and the local Keychain/profile
+    # cache. Xcode's own project still defaults to "Automatically manage
+    # signing", which resolves to whatever identity Xcode picks for the
+    # current run destination — usually a development certificate — and an
+    # archive build signs with THAT, independent of ExportOptions.plist's
+    # `signingStyle: manual` (that governs re-export only, after the archive
+    # already exists). Pin Release to the profile `sigh` just installed so
+    # archiving and exporting agree, instead of leaving a user to discover the
+    # mismatch by hand in Xcode. Debug and Profile are left untouched: this
+    # tool never builds either for release, and a developer still needs an
+    # ordinary development identity to run and profile on a device.
+    update_code_signing_settings(
+      path: abs("ios/Runner.xcodeproj"),
+      use_automatic_signing: false,
+      team_id: ios_team_id,
+      build_configurations: ["Release"],
+      code_sign_identity: "Apple Distribution",
+      profile_name: ios_profile_name,
+      bundle_identifier: ios_bundle_id
+    )
+
     UI.success("Certificate: #{Actions.lane_context[SharedValues::CERT_CERTIFICATE_ID]}")
     UI.success("Profile: #{Actions.lane_context[SharedValues::SIGH_NAME]}")
+    UI.success("Xcode's Release configuration now signs manually with this profile")
     UI.important("Back up #{signing_output_dir}/*.p12 — Apple never re-issues a private key")
   end
 
@@ -577,7 +613,20 @@ def config
         #{KIT_ROOT}/bin/frk onboard #{PROJECT_ROOT}
     MSG
 
-    loaded = YAML.load_file(path) || {}
+    # safe_load rather than load_file, with the permitted set and `aliases:`
+    # spelled out. load_file behaves differently on either side of Psych 4: on
+    # Psych 3 (system Ruby 2.6) it is an unrestricted load that accepts anchors,
+    # on Psych 4+ it is a safe load that rejects them with AliasesNotEnabled.
+    # Anchors are how an app shares settings between its android and ios blocks,
+    # so they stay allowed — and Symbol stays permitted because Psych 5 permits
+    # it by default and dropping it would narrow the configs this kit accepts.
+    loaded = begin
+      YAML.safe_load(File.read(path), permitted_classes: [Symbol, Date, Time], aliases: true, filename: path) || {}
+    rescue Psych::SyntaxError => e
+      # A typo in release_kit.yml is the likeliest failure of all; without this
+      # it surfaces as a fastlane crash report with a raw Ruby backtrace.
+      UI.user_error!("#{CONFIG_PATH} is not valid YAML: #{e.message}")
+    end
     UI.user_error!("#{CONFIG_PATH} is not a YAML mapping") unless loaded.is_a?(Hash)
     loaded["name"] ||= File.basename(PROJECT_ROOT)
     loaded
@@ -649,8 +698,69 @@ def android_track
   track
 end
 
+# Coerced explicitly rather than by Ruby truthiness. A bare Ruby `? :` gets this
+# wrong in both directions: a blank `obfuscate:` line is nil, which is falsey, so
+# `fetch`'s default never applied and the release shipped unobfuscated; while
+# `0`, `"no"` and `""` are all truthy in Ruby, so values that read as "off"
+# turned obfuscation on. The vocabulary is `boolean_word`'s, shared with
+# `truthy?`, so both halves stay mirror images of each other.
+#
+# nil, "" and "   " all mean "no intent expressed" -- the same situation as
+# omitting the key -- and take the documented default. A value that IS a stated
+# intent but is not interpretable (a typo) stops the run, because guessing either
+# way ships the wrong artifact and guessing "on" would ship an unobfuscated
+# release under a config that asked for one.
 def obfuscate?
-  config.fetch("obfuscate", true) ? true : false
+  value = config.fetch("obfuscate", true)
+  return true if value.nil?
+  return value if value == true || value == false
+  return true if value.to_s.strip.empty?
+
+  decided = boolean_word(value)
+  return decided unless decided.nil?
+
+  UI.user_error!("#{CONFIG_PATH}: obfuscate must be true or false (got #{value.inspect})")
+end
+
+# Appended to every `flutter build` invocation, after every flag this tool
+# already sets and before the version flags, so `--build-name`/`--build-number`
+# always win if a value here ever collided with them. Exists for `--dart-define`
+# and other project-specific flags this tool has no opinion about; empty by
+# default, so every existing app keeps building exactly as it does today.
+#
+# Two sources, concatenated: the top-level list (applies to every platform the
+# app ships) and that platform's own list under `android:`/`ios:` (applies to
+# it alone) -- a flag needed on Android but not iOS belongs only in the
+# second. Each is validated on its own, so a mistake in one names itself
+# rather than the other.
+#
+# Both must be real YAML lists, never one string with several flags run
+# together: `flutter(*args)` shell-escapes each ARRAY ELEMENT as its own
+# token, so "--dart-define=A=1 --dart-define=B=2" as a single string would
+# arrive as one unsplittable argument instead of two flags, rather than being
+# silently space-split (which would reopen the injection risk that
+# array-based escaping exists to close).
+def extra_build_args_list(raw, label)
+  return [] if raw.nil?
+  unless raw.is_a?(Array) && raw.all? { |v| v.is_a?(String) }
+    UI.user_error!(
+      "#{CONFIG_PATH}: #{label} must be a list of strings, e.g.\n" \
+      "  #{label.split('.').last}:\n" \
+      "    - \"--dart-define=KEY=value\"\n" \
+      "(got #{raw.inspect})"
+    )
+  end
+  raw
+end
+
+def extra_build_args(platform)
+  # Reads the section directly rather than through `platform_config`, which
+  # raises if `android:`/`ios:` is absent or empty -- a check that belongs to
+  # REQUIRED settings like package_name, not to this optional one. A project
+  # with no platform-specific extra args yet is not a configuration error.
+  platform_section = config[platform.to_s] || {}
+  extra_build_args_list(config["extra_build_args"], "extra_build_args") +
+    extra_build_args_list(platform_section["extra_build_args"], "#{platform}.extra_build_args")
 end
 
 # How long one TestFlight upload attempt may run before it is cancelled and
@@ -704,8 +814,23 @@ end
 # Helpers
 # =============================================================================
 
+# The one boolean vocabulary in this file: true / false / nil for "not a boolean
+# word at all". The two halves are deliberate mirror images covering the YAML 1.1
+# spellings a user could reasonably quote -- Psych resolves the BARE forms
+# (`on`, `off`, `yes`, `no`) to real booleans itself, so only the quoted ones
+# ever reach here, and an incomplete half turns a working config into an error.
+# Callers decide what nil means: `truthy?` reads it as false, `obfuscate?` stops.
+def boolean_word(value)
+  word = value.to_s.strip.downcase
+  return true if %w[true yes y on 1].include?(word)
+  return false if %w[false no n off 0].include?(word)
+
+  nil
+end
+
+# Opt-in flags: anything that is not a recognised "on" word means "do the work".
 def truthy?(value)
-  %w[true 1 yes y].include?(value.to_s.strip.downcase)
+  boolean_word(value) == true
 end
 
 def abs(relative)
@@ -717,8 +842,8 @@ def newest(glob)
   Dir.glob(File.join(PROJECT_ROOT, glob)).max_by { |f| File.mtime(f) }
 end
 
-def flutter(args)
-  sh("cd #{PROJECT_ROOT.shellescape} && #{FLUTTER_BIN.shellescape} #{args}")
+def flutter(*args) # Escapes only the arguments that need it. `shelljoin` would render every `--flag=value` as `--flag\=value`, and this `sh` has no `log: false`, so fastlane echoes the string three times per build -- backslashes there would change `frk build` stdout. The pass-through set is Shellwords' own minus newline, plus `=` for the `--flag=value` form; nothing in it can quote, expand, glob, redirect or separate, so a pass-through cannot widen argv. Anything else, empty string included, is shellescaped exactly once. Per-character rationale and both halves of that property: tests/ruby/test_release_kit.rb, "--- flutter ---".
+  sh("cd #{PROJECT_ROOT.shellescape} && #{FLUTTER_BIN.shellescape} #{args.flatten.map { |a| a = a.to_s; a.match?(%r{\A[A-Za-z0-9\-_./=+:@,]+\z}) ? a : a.shellescape }.join(' ')}")
 end
 
 # --build-name / --build-number, from lane options then env. Unset means "use
@@ -728,17 +853,26 @@ def version_args(options, env_prefix)
   name   = options[:build_name]   || ENV["#{env_prefix}_BUILD_NAME"]
   number = options[:build_number] || ENV["#{env_prefix}_BUILD_NUMBER"]
 
-  fallback_name, fallback_number = pubspec_version.split("+", 2)
-  effective_name = name.to_s.strip.empty? ? fallback_name.to_s.strip : name.to_s.strip
-  effective_number = number.to_s.strip.empty? ? fallback_number.to_s.strip : number.to_s.strip
+  fallback_name, fallback_number = pubspec_version_parts
+  effective_name = name.to_s.strip.empty? ? fallback_name : name.to_s.strip
+  effective_number = number.to_s.strip.empty? ? fallback_number : number.to_s.strip
   UI.user_error!("Build name cannot be empty or contain whitespace") if effective_name.empty? || effective_name.match?(/\s/)
+  # Reachable only when nothing was overridden, since a supplied number is never
+  # empty here. The generic integer complaint below would say "(got '')" without
+  # ever naming the file the user has to edit.
+  if effective_number.empty?
+    UI.user_error!(
+      "pubspec.yaml has no build number — `version: #{fallback_name}` needs a `+<number>` " \
+      "suffix (for example `#{fallback_name}+1`). Add one, or pass build_number:<n>."
+    )
+  end
   unless effective_number.match?(/\A[1-9]\d*\z/) && effective_number.to_i <= 2_100_000_000
     UI.user_error!("Build number must be an integer between 1 and 2100000000 (got '#{effective_number}')")
   end
 
   args = []
-  args << "--build-name=#{name.to_s.strip.shellescape}" unless name.to_s.strip.empty?
-  args << "--build-number=#{number.to_s.strip.shellescape}" unless number.to_s.strip.empty?
+  args << "--build-name=#{name.to_s.strip}" unless name.to_s.strip.empty?
+  args << "--build-number=#{number.to_s.strip}" unless number.to_s.strip.empty?
 
   if args.empty?
     UI.message("Version: pubspec.yaml (#{pubspec_version})")
@@ -762,7 +896,23 @@ def reject_version_override_with_skip_build!(options, env_prefix)
 end
 
 def pubspec_version
-  File.read(abs("pubspec.yaml"))[/^version:\s*(\S+)/, 1].to_s
+  path = abs("pubspec.yaml")
+  UI.user_error!("pubspec.yaml not found in #{PROJECT_ROOT} — this is not a Flutter project") unless File.file?(path)
+  File.read(path)[/^version:\s*(\S+)/, 1].to_s
+end
+
+# The `<name>+<number>` halves of the pubspec version, parsed once. Four call
+# sites used to split this string four different ways, and the two that took
+# `.split("+").last` read the whole version as the build number whenever the
+# `+N` suffix was missing — which silently disabled both duplicate-version
+# guards. Deliberately never raises: a pubspec with no `version:` still builds
+# when both overrides are supplied, and every caller reaches this only after
+# `||` has failed to find an override. Refusing here would break that.
+def pubspec_version_parts
+  @pubspec_version_parts ||= begin
+    name, number = pubspec_version.split("+", 2)
+    [name.to_s.strip, number.to_s.strip]
+  end
 end
 
 # --- shared credentials -------------------------------------------------------
@@ -874,9 +1024,18 @@ end
 # from a real permissions failure (supply/lib/supply/client.rb:501; its rescue
 # only covers the 404 "track not found" case).
 #
-# Returns { ok: true, internal_codes: [...], uploaded_codes: [...] }
-#      or { ok: false, denied: bool, message: String }. Never raises.
-def play_status(json_key)
+# Returns { ok: true, internal_codes: [...], uploaded_codes: [...], tracks: [...] }
+#      or { ok: false, denied: bool, message: String } for anything Play refuses
+# or the network eats. A user error raised while resolving this app's own config
+# still propagates — that is a setup mistake, not a Play answer.
+#
+# `include_tracks:` adds one more read (`list_edit_tracks`) inside the same edit,
+# because version codes are PER TRACK and the configured track alone does not say
+# what the rest of the app already holds. It is opt-in and defaults to off so the
+# release path keeps making exactly the calls it made before, and so a failure of
+# that extra read can never downgrade the version-code guard: it is rescued
+# locally to an empty list rather than turning the whole answer into ok: false.
+def play_status(json_key, include_tracks: false)
   require "google/apis/androidpublisher_v3"
   require "googleauth"
 
@@ -884,10 +1043,14 @@ def play_status(json_key)
   track = android_track
 
   service = Google::Apis::AndroidpublisherV3::AndroidPublisherService.new
-  service.authorization = Google::Auth::ServiceAccountCredentials.make_creds(
-    json_key_io: File.open(json_key),
-    scope: [Google::Apis::AndroidpublisherV3::AUTH_ANDROIDPUBLISHER]
-  )
+  # Block form: make_creds reads the key and does not take ownership of the
+  # handle, so the bare File.open left a descriptor open for the whole run.
+  service.authorization = File.open(json_key) do |io|
+    Google::Auth::ServiceAccountCredentials.make_creds(
+      json_key_io: io,
+      scope: [Google::Apis::AndroidpublisherV3::AUTH_ANDROIDPUBLISHER]
+    )
+  end
 
   edit = service.insert_edit(package)
   begin
@@ -896,7 +1059,8 @@ def play_status(json_key)
     {
       ok: true,
       internal_codes: (on_track.releases || []).flat_map { |r| r.version_codes || [] }.map(&:to_i).sort,
-      uploaded_codes: (bundles.bundles || []).map { |b| b.version_code.to_i }.sort
+      uploaded_codes: (bundles.bundles || []).map { |b| b.version_code.to_i }.sort,
+      tracks: include_tracks ? play_track_summaries(service, package, edit.id) : []
     }
   ensure
     # Read-only probe: throw the edit away rather than leaving it open.
@@ -917,8 +1081,61 @@ rescue Google::Apis::ClientError => e
     status_code: e.status_code,
     message: play_error_message(e)
   }
+rescue FastlaneCore::Interface::FastlaneError
+  # `android_package` and `android_track` raise this for a bad release_kit.yml.
+  # That is a setup mistake, not something Play said, and folding it into
+  # `ok: false` made `warn_if_version_code_not_higher` downgrade it to
+  # "skipping the version-code check" — so the run continued through a full
+  # release build before the lane body finally rejected the track.
+  raise
 rescue StandardError => e
   { ok: false, denied: false, missing: false, status_code: nil, message: e.message }
+end
+
+# One entry per Play track that actually holds a release, as
+# { "track" => "internal", "versionCode" => 38, "versionName" => "2.0.9" | nil }.
+#
+# Tracks with no releases are dropped rather than reported with a null code: an
+# empty track says nothing, and an entry that exists but is blank reads like a
+# failed read. Best-effort by design — a caller that already has the configured
+# track's codes must not lose them because this extra read failed.
+def play_track_summaries(service, package, edit_id)
+  response = service.list_edit_tracks(package, edit_id)
+  summaries = Array(response && response.tracks).map do |entry|
+    releases = Array(entry.releases)
+    codes = releases.flat_map { |r| Array(r.version_codes) }.map(&:to_i).reject { |c| c <= 0 }
+    next nil if codes.empty?
+
+    highest = codes.max
+    newest = releases.max_by { |r| Array(r.version_codes).map(&:to_i).max || 0 }
+    {
+      "track" => entry.track.to_s,
+      "versionCode" => highest,
+      "versionName" => play_release_version_name(newest, highest)
+    }
+  end
+  summaries.compact
+rescue StandardError => e
+  UI.verbose("could not list Play tracks: #{e.message}")
+  []
+end
+
+# The Play Publishing API does not expose a versionName anywhere: neither a
+# TrackRelease nor a Bundle carries one. The only place the string survives is
+# the release's display `name`, which Play defaults to "<versionName> (<code>)".
+#
+# So this parses rather than reads, and refuses to guess: a name that is not
+# recognisably a version returns nil, because a wrong version name in a
+# duplicate-detection report is worse than an absent one.
+def play_release_version_name(release, version_code)
+  name = release.respond_to?(:name) ? release.name.to_s.strip : ""
+  return nil if name.empty?
+
+  match = name.match(/\A(.+?)\s*\(#{version_code}\)\z/)
+  candidate = (match ? match[1] : name).strip
+  return nil unless candidate.match?(/\A\d+(\.\d+)*([-+][0-9A-Za-z.\-]+)?\z/)
+
+  candidate
 end
 
 # `Google::Apis::ClientError#message` is a generic label — every 4xx from the
@@ -938,7 +1155,7 @@ end
 # Android version stream well ahead of pubspec.yaml, which makes a
 # silent duplicate very easy to produce.
 def warn_if_version_code_not_higher(options, json_key)
-  local = (options[:build_number] || ENV["ANDROID_BUILD_NUMBER"] || pubspec_version.split("+").last).to_s.strip
+  local = (options[:build_number] || ENV["ANDROID_BUILD_NUMBER"] || pubspec_version_parts[1]).to_s.strip
   return unless local.match?(/\A\d+\z/)
 
   status = play_status(json_key)
@@ -1085,8 +1302,8 @@ def asc_api_key
 end
 
 def ios_version(options)
-  name   = (options[:build_name] || ENV["IOS_BUILD_NAME"] || pubspec_version.split("+").first).to_s.strip
-  number = (options[:build_number] || ENV["IOS_BUILD_NUMBER"] || pubspec_version.split("+").last).to_s.strip
+  name   = (options[:build_name] || ENV["IOS_BUILD_NAME"] || pubspec_version_parts[0]).to_s.strip
+  number = (options[:build_number] || ENV["IOS_BUILD_NUMBER"] || pubspec_version_parts[1]).to_s.strip
   [name, number]
 end
 
@@ -1167,6 +1384,14 @@ end
 def upload_to_testflight_with_retry(api_key:, ipa:, version:, number:, wait:, changelog:)
   attempts  = ios_upload_attempts
   timeout_s = ios_upload_timeout_minutes * 60
+  # Kept across attempts so the give-up message can name what actually went
+  # wrong. Without it a permanent failure — a revoked key, an invalid binary —
+  # was reported as "Apple's transport stalls at random".
+  last_error = nil
+  # Every transporter/altool already running belongs to another release on this
+  # machine, and cancellation must leave those alone. Taken once, before the
+  # first attempt: from here on, a process that appears is ours.
+  preexisting_uploads = transporter_pids
 
   attempts.times do |i|
     attempt = i + 1
@@ -1181,11 +1406,22 @@ def upload_to_testflight_with_retry(api_key:, ipa:, version:, number:, wait:, ch
     # if two threads do that at once. So the watchdog is the thread instead — it
     # only sleeps and then kills the transfer, which makes the blocking upload on
     # the main thread fail fast and fall into the retry path below.
+    #
+    # Held for the whole of a cancellation. Without it the main thread reaches
+    # `watchdog.kill` below while kill_transporter! is still inside its
+    # five-second SIGTERM grace period — that is the normal ordering, not a rare
+    # race, because SIGTERM makes the blocked upload raise within milliseconds —
+    # and Thread#kill then tore the watchdog down before the SIGKILL escalation
+    # could run. Every `watchdog.kill` therefore takes this lock first.
+    cancelling = Mutex.new
+
     watchdog = Thread.new do
       sleep(timeout_s)
       timed_out = true
-      UI.important("Attempt #{attempt} exceeded #{ios_upload_timeout_minutes} min — cancelling the transfer")
-      kill_transporter!
+      cancelling.synchronize do
+        UI.important("Attempt #{attempt} exceeded #{ios_upload_timeout_minutes} min — cancelling the transfer")
+        kill_transporter!(preexisting_uploads)
+      end
     end
 
     begin
@@ -1198,26 +1434,31 @@ def upload_to_testflight_with_retry(api_key:, ipa:, version:, number:, wait:, ch
         changelog: wait ? changelog : nil,
         distribute_external: false
       )
-      watchdog.kill
+      cancelling.synchronize { watchdog.kill }
       UI.success("Uploaded #{version} (#{number}) to TestFlight in #{(Time.now - started).round}s")
       return
     rescue StandardError => e
-      watchdog.kill
+      cancelling.synchronize { watchdog.kill }
+      last_error = e
       elapsed = (Time.now - started).round
 
+      # A validation rejection is final — App Store Connect refused the binary.
+      # Retrying or polling would only waste time. Checked before the watchdog
+      # branch, not inside its `else`: Apple's refusal does not become retryable
+      # because our own timer happened to expire first, and a cancelled attempt
+      # surfaces the rejection text just the same.
+      if (rejection = validation_rejection(e.message))
+        UI.user_error!(rejection)
+      end
+
       if timed_out
+        UI.important("Attempt #{attempt} was cancelled after #{elapsed}s: #{e.message.lines.first.to_s.strip}")
         # The stall may have come after the bytes were already delivered.
         if testflight_has_build?(api_key, version, number, attempts: 2, delay: 20)
           UI.success("#{version} (#{number}) reached TestFlight despite the stall")
           return
         end
       else
-        # A validation rejection is final — App Store Connect refused the binary.
-        # Retrying or polling would only waste time.
-        if (rejection = validation_rejection(e.message))
-          UI.user_error!(rejection)
-        end
-
         # Transporter retries chunks internally and can deliver the build while
         # still surfacing those retries as a fatal error (classic case:
         # NSURLErrorDomain -1005 "network connection was lost"). Ask App Store
@@ -1241,7 +1482,7 @@ def upload_to_testflight_with_retry(api_key:, ipa:, version:, number:, wait:, ch
         end
       end
     ensure
-      watchdog.kill if watchdog.alive?
+      cancelling.synchronize { watchdog.kill } if watchdog.alive?
     end
 
     UI.important("Retrying — Apple's transport stalls at random and usually " \
@@ -1251,6 +1492,9 @@ def upload_to_testflight_with_retry(api_key:, ipa:, version:, number:, wait:, ch
   UI.user_error!(<<~MSG)
     #{version} (#{number}) did not reach TestFlight after #{attempts} attempts,
     each capped at #{ios_upload_timeout_minutes} minutes.
+
+    The last attempt failed with:
+      #{last_error&.message.to_s.lines.first.to_s.strip}
 
     Apple's Transporter stalling is usually transient, so this many failures in a
     row suggests something else. Check your connection, then:
@@ -1263,16 +1507,102 @@ def upload_to_testflight_with_retry(api_key:, ipa:, version:, number:, wait:, ch
   MSG
 end
 
+# Cancellation works in PIDs, not in patterns.
+#
+# The old shape ran `pkill -x altool` and `pkill -f iTMSTransporter` through
+# fastlane's `sh`. A pattern kill cannot tell OUR upload from one belonging to
+# another release on the same machine, so recovery took out both — a caveat the
+# README had to carry. It also went through `sh`, which wraps its argument in
+# `/bin/sh -c "<command>"`, giving the wrapper an argv containing the very
+# pattern being matched; the only reason that never signalled the shell running
+# it is that macOS excludes pgrep/pkill's own ancestors from the match list
+# (pkill(1): "the current pgrep or pkill process and all of its ancestors are
+# excluded"), which is an accident of the platform rather than a property of
+# this code.
+#
+# So: scan for PIDs before the upload starts, signal only PIDs that were not in
+# that scan, and signal from Ruby. Nothing here creates a shell and nothing
+# matches a pattern at kill time, so neither problem can return.
+
+# PIDs printed by pgrep. Only bare decimal lines survive: a future flag typo
+# makes pgrep print usage text, and a diagnostic must never become a kill target.
+def parse_pid_list(text)
+  text.to_s.split("\n").map { |line| line.strip[/\A\d+\z/] }.compact.map(&:to_i).uniq
+end
+
+# `IO.popen` with an ARGUMENT ARRAY execs pgrep directly — there is no
+# `/bin/sh -c` wrapper, so there is no wrapper argv for the pattern to match.
+# pgrep exits 1 when nothing matches, which is not an error here.
+def pgrep_pids(flag, pattern)
+  parse_pid_list(IO.popen(["pgrep", flag, pattern], err: File::NULL, &:read))
+rescue StandardError => e
+  UI.verbose("pgrep #{flag} #{pattern} failed: #{e.message}")
+  []
+end
+
+# Anything that could be an upload in flight. The transporter is matched on the
+# full command line on purpose: Apple ships a shell wrapper that execs the JVM,
+# and a narrower pattern would leave that wrapper holding the network — exactly
+# the failure this function exists to prevent.
+def transporter_pids
+  (pgrep_pids("-f", "iTMSTransporter") + pgrep_pids("-x", "altool")).uniq
+end
+
+def process_command_line(pid)
+  IO.popen(["ps", "-o", "command=", "-p", pid.to_s], err: File::NULL, &:read).to_s.strip
+rescue StandardError
+  ""
+end
+
+# The single call that actually signals, split out so it can be observed in a
+# test without signalling anything real.
+def kill_process(signal, pid)
+  Process.kill(signal, pid)
+end
+
+# The PIDs that actually received the signal. One that exited between the scan
+# and the signal is the outcome we wanted, not a failure.
+def signal_pids!(signal, pids)
+  pids.select do |pid|
+    begin
+      kill_process(signal, pid)
+      true
+    rescue Errno::ESRCH
+      false
+    rescue StandardError => e
+      UI.important("Could not send SIG#{signal} to pid #{pid}: #{e.message}")
+      false
+    end
+  end
+end
+
 # Stop an in-flight upload. altool drives a Java iTMSTransporter child, and
 # killing the Ruby thread alone would leave it running and holding the network.
-def kill_transporter!
-  # -x matches the exact process name so this cannot match a grep of our own.
-  sh("pkill -x altool 2>/dev/null || true", log: false)
-  sh("pkill -f iTMSTransporter 2>/dev/null || true", log: false)
+#
+# `preexisting` is the PID scan taken before this upload started; those processes
+# belong to somebody else and are never signalled.
+def kill_transporter!(preexisting = [])
+  targets = transporter_pids - Array(preexisting)
+  if targets.empty?
+    UI.important("No upload process of this run is left to cancel")
+    return
+  end
+
+  targets.each do |pid|
+    UI.important("Cancelling upload process #{pid}: #{process_command_line(pid)}")
+  end
+
+  signalled = signal_pids!("TERM", targets)
+  return if signalled.empty?
+
   sleep(5)
-  still = sh("pgrep -x altool >/dev/null 2>&1 && echo yes || echo no", log: false).strip
-  UI.important("altool did not exit after SIGTERM; sending SIGKILL") if still == "yes"
-  sh("pkill -9 -x altool 2>/dev/null || true", log: false) if still == "yes"
+  # Re-scan rather than probe with signal 0: a PID that has been reused since the
+  # SIGTERM is only a target again if it is still a transporter or an altool.
+  still = signalled & transporter_pids
+  return if still.empty?
+
+  still.each { |pid| UI.important("pid #{pid} did not exit after SIGTERM; sending SIGKILL") }
+  signal_pids!("KILL", still)
 end
 
 # Apple closes a "pre-release train" once a version has been through review, and
@@ -1315,19 +1645,40 @@ end
 
 # Marketing versions that already reached the App Store. Building one of these
 # again is rejected, so it is worth knowing before an archive.
+#
+# Best-effort: any store failure answers [] and a verbose log line, because the
+# release-path callers use this as an extra guard and must not fail a release
+# over one flaky read. THAT MAKES [] AMBIGUOUS — it means "the App Store lists
+# nothing" and "the App Store did not answer" alike. Anything that reports to a
+# human has to tell those apart, and must call `appstore_released_versions!` and
+# handle the exception instead.
 def appstore_released_versions(api_key)
+  appstore_released_versions!(api_key)
+rescue FastlaneCore::Interface::FastlaneError
+  # `ios_bundle_id` raises this for a missing `ios.bundle_id`. Swallowing it
+  # returned [] and silently skipped the released-version guard in
+  # `warn_if_testflight_build_taken`.
+  raise
+rescue StandardError => e
+  UI.verbose("could not read App Store versions: #{e.message}")
+  []
+end
+
+# The same read with every failure left to the caller.
+def appstore_released_versions!(api_key)
   require "spaceship"
   Spaceship::ConnectAPI.token = Spaceship::ConnectAPI::Token.create(**api_key)
   app = Spaceship::ConnectAPI::App.find(ios_bundle_id)
-  return [] if app.nil?
+  # Not []: an app this key cannot see is not an app that has never shipped, and
+  # a caller that reports the second sentence to a user sends them off to reuse
+  # a version number the App Store already holds. A plain error, not a fastlane
+  # user error, so the best-effort wrapper above still absorbs it.
+  raise "App Store Connect has no app with this bundle id, or this key cannot see it" if app.nil?
 
   terminal = %w[READY_FOR_SALE APPROVED PENDING_DEVELOPER_RELEASE REPLACED_WITH_NEW_INFO]
   app.get_app_store_versions(limit: 50)
      .select { |v| terminal.include?(v.app_store_state.to_s) }
      .map { |v| v.version_string.to_s }
-rescue StandardError => e
-  UI.verbose("could not read App Store versions: #{e.message}")
-  []
 end
 
 def warn_if_testflight_build_taken(options, api_key)
@@ -1447,4 +1798,531 @@ def export_options_plist(team_id, bundle_id)
     </dict>
     </plist>
   PLIST
+end
+
+# =============================================================================
+# Store version report (READ ONLY)
+# =============================================================================
+#
+# One version-name field and one build-number field in pubspec.yaml cannot
+# describe two stores: Play and App Store Connect count uploads independently,
+# so their build numbers drift apart and the duplicate is discovered when the
+# upload is rejected. `fastlane store_versions` answers, before anything is
+# built, what each store already holds.
+#
+# It reports FACTS ONLY. There is deliberately no "next" or "suggested" number
+# anywhere in the payload: version numbers are never auto-incremented by this
+# kit, and a suggestion the user has to accept belongs in the client, not here.
+#
+# Read-only in the strict sense: nothing is built, nothing is uploaded, nothing
+# is promoted, nothing is written into the project. The one write-shaped call is
+# Play's `insert_edit`, which opens a scratch transaction that is thrown away
+# again in the same breath (`play_status`); it is the only way the Publishing
+# API lets anyone read a track, and it is the same probe `check_credentials`
+# has always used.
+#
+# --- output contract ---------------------------------------------------------
+#
+# Exactly one line on stdout:
+#
+#   <<<FRK:STORE_VERSIONS:1>>> {"project":…,"checkedAt":…,"android":{…},"ios":{…}}
+#
+# fastlane writes a great deal to stdout — banners, tables, ANSI colour, plugin
+# chatter — and it does not always end that output with a newline, so a "last
+# line" or "line that starts with {" parse is not safe. The marker is the
+# contract: scan every line for STORE_VERSIONS_MARKER as a SUBSTRING, take
+# everything after it on that line as the JSON document, and if more than one
+# line carries the marker use the LAST one. The trailing `:1` is the payload
+# version and changes only if the shape changes incompatibly.
+#
+# `protocolVersion` and `cliVersion` are NOT emitted here: this file has no idea
+# which CLI invoked it. The CLI wraps this document with those two fields.
+#
+# --- never raises ------------------------------------------------------------
+#
+# The desktop app calls this speculatively behind a spinner and kills the
+# process to cancel, so a crash report is a worse answer than "could not check".
+# Every path returns a platform object carrying `status` and `detail`, including
+# the paths where release_kit.yml itself is unreadable.
+#
+# The guarantee covers the whole way to stdout, not just building the report:
+# serialising it and logging it are inside it too (`emit_store_versions_report`).
+#
+# --- never guesses -----------------------------------------------------------
+#
+# A store that could not be read is never reported as a store that holds
+# nothing. The two halves of each platform fail independently and are reported
+# independently, because a confident wrong answer ("nothing has been released")
+# costs the user a rejected upload, while an honest "could not read" costs them
+# a retry.
+#
+# --- never leaks -------------------------------------------------------------
+#
+# No key path, key id, issuer id, service-account email or token reaches the
+# payload. Sentences written here are written by hand; any text that came from
+# outside (a store error, an exception message) goes through
+# `store_versions_safe_message` first.
+
+STORE_VERSIONS_MARKER = "<<<FRK:STORE_VERSIONS:1>>>".freeze
+
+# Seconds one platform's probe may run before it is reported as unavailable.
+# Both platforms get their own budget, so the worst case is twice this.
+STORE_VERSIONS_TIMEOUT_SECONDS = 60
+
+# How many TestFlight builds to include. Apple scopes build numbers to the
+# version string, so a single "latest build" is meaningless — the client needs
+# enough of the list to find the train it cares about.
+STORE_VERSIONS_BUILD_LIMIT = 10
+
+# Applied to text this file did not write. Ordered widest-context first so a
+# private key or a path is gone before the narrower rules chew on its pieces.
+STORE_VERSIONS_REDACTIONS = [
+  /-----BEGIN[\s\S]*/,                                                    # PEM private key material
+  /[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/,                     # service-account and Apple ID emails
+  /\b[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\b/,             # issuer ids (UUIDs)
+  %r{(?:~|/)[\w.\-+]+(?:/[\w.\-+]*)+},                                    # absolute and home-relative paths
+  /\b[0-9A-Z]{10}\b/,                                                     # App Store Connect key ids and team ids
+  %r{\b[A-Za-z0-9+/=_\-]{24,}\b}                                          # bearer tokens, base64 blobs
+].freeze
+
+# The report of last resort: emitted only when building the real one threw AND
+# building the fallback threw too, or when JSON refused to serialise what was
+# built. Written out in full, in plain ASCII, so that nothing between here and
+# stdout can fail the way the thing it replaces did. `checkedAt` is empty on
+# purpose — the CLI substitutes its own moment for a timestamp it cannot parse,
+# and a made-up one here would be worse than none.
+STORE_VERSIONS_UNREPORTABLE_DETAIL =
+  "This project's store report could not be produced, so this store was not read.".freeze
+STORE_VERSIONS_UNREPORTABLE = {
+  "project" => "",
+  "checkedAt" => "",
+  "android" => {
+    "status" => "unavailable",
+    "detail" => STORE_VERSIONS_UNREPORTABLE_DETAIL,
+    "track" => nil,
+    "latestVersionCode" => nil,
+    "latestVersionName" => nil,
+    "tracks" => []
+  },
+  "ios" => {
+    "status" => "unavailable",
+    "detail" => STORE_VERSIONS_UNREPORTABLE_DETAIL,
+    "latestAppStoreVersion" => nil,
+    "builds" => []
+  }
+}.freeze
+
+# Entry point for the lane. The marker line reaches stdout whatever happens,
+# because a client waiting on that line would otherwise hang until its own
+# timeout with nothing to show the user.
+#
+# EVERYTHING on the way to that line is inside the guarantee, not just the
+# report-building call: the two log lines below read into the report, and
+# JSON.generate can refuse a string a store handed us. Both used to sit outside
+# the rescue, so either could still take the whole lane down.
+def emit_store_versions_report(options = {})
+  report = store_versions_reported(options)
+  line = store_versions_marker_line(report)
+
+  begin
+    UI.message("Android: #{report['android']['detail']}")
+    UI.message("iOS: #{report['ios']['detail']}")
+  rescue StandardError
+    # The log lines are a courtesy for whoever is watching the run. The marker
+    # line is the contract, and it goes out either way.
+    nil
+  end
+
+  $stdout.puts(line)
+  $stdout.flush
+  report
+end
+
+# The report, or a stand-in written in this file — never an exception.
+def store_versions_reported(options)
+  store_versions_report(options)
+rescue StandardError => e
+  begin
+    store_versions_fallback_report(e)
+  rescue StandardError
+    STORE_VERSIONS_UNREPORTABLE
+  end
+end
+
+# The one line the client parses, or the stand-in's line if this report cannot
+# be serialised — invalid UTF-8 out of a store error is the realistic way in.
+def store_versions_marker_line(report)
+  "#{STORE_VERSIONS_MARKER} #{JSON.generate(report)}"
+rescue StandardError
+  "#{STORE_VERSIONS_MARKER} #{JSON.generate(STORE_VERSIONS_UNREPORTABLE)}"
+end
+
+def store_versions_report(options = {})
+  seconds = store_versions_timeout(options)
+  {
+    "project" => store_versions_project_name,
+    # UTC with milliseconds, so two checks a second apart are distinguishable.
+    "checkedAt" => Time.now.utc.strftime("%Y-%m-%dT%H:%M:%S.%LZ"),
+    "android" => store_versions_android(seconds),
+    "ios" => store_versions_ios(seconds)
+  }
+end
+
+def store_versions_fallback_report(error)
+  detail = "This project's release setup could not be read: #{store_versions_safe_message(error.message)}"
+  {
+    "project" => File.basename(PROJECT_ROOT),
+    "checkedAt" => Time.now.utc.strftime("%Y-%m-%dT%H:%M:%S.%LZ"),
+    "android" => store_versions_android_state("unconfigured", detail),
+    "ios" => store_versions_ios_state("unconfigured", detail)
+  }
+end
+
+def store_versions_project_name
+  config["name"].to_s
+rescue StandardError
+  File.basename(PROJECT_ROOT)
+end
+
+def store_versions_timeout(options)
+  raw = (options || {})[:timeout] || ENV["FRK_STORE_VERSIONS_TIMEOUT"] || STORE_VERSIONS_TIMEOUT_SECONDS
+  seconds = raw.to_i
+  seconds.positive? ? seconds : STORE_VERSIONS_TIMEOUT_SECONDS
+end
+
+# Every key is always present, with null or [] for "not known", so a client can
+# read one shape regardless of status instead of branching on key existence.
+def store_versions_android_state(status, detail, track: nil, latest_code: nil, latest_name: nil, tracks: [])
+  {
+    "status" => status,
+    "detail" => store_versions_sentence(detail),
+    "track" => track,
+    "latestVersionCode" => latest_code,
+    "latestVersionName" => latest_name,
+    "tracks" => tracks
+  }
+end
+
+def store_versions_ios_state(status, detail, latest_release: nil, builds: [])
+  {
+    "status" => status,
+    "detail" => store_versions_sentence(detail),
+    "latestAppStoreVersion" => latest_release,
+    "builds" => builds
+  }
+end
+
+def store_versions_sentence(text)
+  one_line = text.to_s.gsub(/\s+/, " ").strip
+  one_line.length > 400 ? "#{one_line[0, 397]}..." : one_line
+end
+
+# For text that came from a store, a gem or an exception. First line only (the
+# rest is invariably a backtrace or a setup essay), then every credential shape
+# this kit handles is replaced before the words are allowed near the payload.
+def store_versions_safe_message(text)
+  cleaned = text.to_s.lines.first.to_s
+  STORE_VERSIONS_REDACTIONS.each { |pattern| cleaned = cleaned.gsub(pattern, "<redacted>") }
+  store_versions_sentence(cleaned)
+end
+
+# `platforms` raises on an unreadable release_kit.yml. That is still "this
+# project is not set up for android", so it answers false rather than escaping.
+def store_versions_configured?(platform)
+  platforms.include?(platform.to_s)
+rescue StandardError
+  false
+end
+
+def store_versions_unconfigured_detail(platform)
+  "This project does not list #{platform} in `platforms` in #{CONFIG_PATH} (it lists: #{platforms.join(', ')})."
+rescue StandardError => e
+  "#{CONFIG_PATH} could not be read, so #{platform} is not configured: #{store_versions_safe_message(e.message)}"
+end
+
+# --- Android ------------------------------------------------------------------
+
+def store_versions_android(seconds)
+  unless store_versions_configured?(:android)
+    return store_versions_android_state("unconfigured", store_versions_unconfigured_detail("android"))
+  end
+
+  begin
+    android_package
+    track = android_track
+  rescue StandardError => e
+    return store_versions_android_state(
+      "unconfigured",
+      "This project's android section in #{CONFIG_PATH} is not usable: #{store_versions_safe_message(e.message)}"
+    )
+  end
+
+  begin
+    json_key = play_store_json_key
+  rescue StandardError
+    # The message from `play_store_json_key` names key paths, so it is dropped
+    # entirely rather than redacted; `check_credentials` prints it in full.
+    return store_versions_android_state(
+      "no_credentials",
+      "No Google Play service-account key is available, so Play was not contacted; " \
+      "run `fastlane android check_credentials` for the setup steps.",
+      track: track
+    )
+  end
+
+  begin
+    status = Timeout.timeout(seconds) { play_status(json_key, include_tracks: true) }
+  rescue Timeout::Error
+    return store_versions_android_state(
+      "unavailable", "Google Play did not answer within #{seconds} seconds.", track: track
+    )
+  rescue StandardError => e
+    return store_versions_android_state(
+      "unavailable", "Could not read Google Play: #{store_versions_safe_message(e.message)}", track: track
+    )
+  end
+
+  unless status[:ok]
+    return store_versions_android_state("unavailable", store_versions_play_failure_detail(status), track: track)
+  end
+
+  listed = Array(status[:tracks])
+  configured = store_versions_configured_track(track, listed, status)
+  listed += [configured] if configured && listed.none? { |t| t["track"] == track }
+  tracks = store_versions_order_tracks(listed, track)
+  latest_code = store_versions_highest_code(status, tracks)
+  # Pair the name with the code it actually belongs to. Naming the configured
+  # track's version beside another track's higher code would be a lie.
+  owner = tracks.find { |t| t["versionCode"] == latest_code }
+
+  store_versions_android_state(
+    "ok",
+    store_versions_play_detail(latest_code, track, configured),
+    track: track,
+    latest_code: latest_code,
+    latest_name: owner && owner["versionName"],
+    tracks: tracks
+  )
+end
+
+# What is known about the configured track, as a track entry or nil.
+#
+# `status[:tracks]` is the all-tracks listing, which is best-effort and comes
+# back empty when it fails. The configured track is not part of that gamble:
+# `play_status` reads it directly with get_edit_track, and `status[:ok]` is only
+# true if that read succeeded, so `internal_codes` is the answer whatever the
+# listing did. Deriving the configured track from the listing instead turned a
+# failed listing into "the configured track holds no release" — an assertion
+# about a track nothing had read, and the one sentence that makes a user pick a
+# version code Play will reject.
+#
+# The listing is still preferred when it has the track, because only it carries
+# a version name.
+def store_versions_configured_track(track, listed, status)
+  from_listing = listed.find { |t| t["track"] == track }
+  return from_listing if from_listing
+
+  codes = Array(status[:internal_codes]).map(&:to_i).reject { |c| c <= 0 }
+  return nil if codes.empty?
+
+  { "track" => track, "versionCode" => codes.max, "versionName" => nil }
+end
+
+# Play rejects a version code that is already used ANYWHERE in the app, not just
+# on the target track, so the number that matters is the highest one Play has
+# ever seen: uploaded bundles included, since a bundle can exist with no release.
+def store_versions_highest_code(status, tracks)
+  codes = Array(status[:uploaded_codes]) + Array(status[:internal_codes]) + tracks.map { |t| t["versionCode"] }
+  codes = codes.map(&:to_i).reject { |c| c <= 0 }
+  codes.empty? ? nil : codes.max
+end
+
+# Configured track first — it is the one the user is about to upload to — then
+# the rest in a stable order so the client's list does not reshuffle per call.
+def store_versions_order_tracks(tracks, configured)
+  mine, others = tracks.partition { |t| t["track"] == configured }
+  mine + others.sort_by { |t| t["track"].to_s }
+end
+
+def store_versions_play_detail(latest_code, track, configured)
+  return "Google Play holds no version code for this app yet, so any version code is free." if latest_code.nil?
+
+  # "holds no release" is only sayable because get_edit_track answered for this
+  # exact track — see `store_versions_configured_track`. Never say it from a
+  # listing that failed to load.
+  where = if configured
+            "the configured '#{track}' track is at #{configured['versionCode']}"
+          else
+            "the configured '#{track}' track holds no release"
+          end
+  "Google Play's highest known version code is #{latest_code} and #{where}."
+end
+
+def store_versions_play_failure_detail(status)
+  if status[:denied]
+    "Google Play denied this service account access to the app; " \
+      "run `fastlane android check_credentials` for the exact permission to grant."
+  elsif status[:missing]
+    "Google Play has no app with this package name, or the service account cannot see it; " \
+      "run `fastlane android check_credentials` for next steps."
+  else
+    "Could not read Google Play: #{store_versions_safe_message(status[:message])}"
+  end
+end
+
+# --- iOS ----------------------------------------------------------------------
+
+def store_versions_ios(seconds)
+  unless store_versions_configured?(:ios)
+    return store_versions_ios_state("unconfigured", store_versions_unconfigured_detail("ios"))
+  end
+
+  begin
+    ios_bundle_id
+  rescue StandardError => e
+    return store_versions_ios_state(
+      "unconfigured",
+      "This project's ios section in #{CONFIG_PATH} is not usable: #{store_versions_safe_message(e.message)}"
+    )
+  end
+
+  begin
+    api_key = asc_api_key
+  rescue StandardError
+    # Dropped rather than redacted, same reasoning as the Play key: the message
+    # names the .p8 path and the environment variables that hold the key id.
+    return store_versions_ios_state(
+      "no_credentials",
+      "No App Store Connect API key is available, so App Store Connect was not contacted; " \
+      "run `fastlane ios check_credentials` for the setup steps."
+    )
+  end
+
+  # Two independent reads under one deadline. They are kept apart because they
+  # fail apart: App Store Connect can serve the TestFlight build list and refuse
+  # the App Store version list in the same breath, and folding that into one
+  # answer is how "the release list is unreadable" became "nothing has been
+  # released on the App Store yet".
+  builds = released = nil
+  builds_error = released_error = nil
+  timed_out = false
+  begin
+    Timeout.timeout(seconds) do
+      # `testflight_builds` rather than `latest_testflight_build_number`: the
+      # latter only counts builds that finished PROCESSING, so for the first
+      # ~15 minutes after an upload it reports the PREVIOUS build and the app
+      # would tell the user their upload never arrived.
+      builds, builds_error = store_versions_read { testflight_builds(api_key, limit: STORE_VERSIONS_BUILD_LIMIT) }
+      released, released_error = store_versions_read { appstore_released_versions!(api_key) }
+    end
+  rescue Timeout::Error
+    timed_out = true
+  end
+
+  # The deadline almost always lands on the first read, and "App Store Connect
+  # did not answer" is a better sentence than two half-sentences saying it twice.
+  if timed_out && builds.nil? && released.nil? && builds_error.nil? && released_error.nil?
+    return store_versions_ios_state("unavailable", "App Store Connect did not answer within #{seconds} seconds.")
+  end
+
+  builds_problem = store_versions_problem(builds, builds_error, timed_out, seconds)
+  released_problem = store_versions_problem(released, released_error, timed_out, seconds)
+  entries = Array(builds).map { |build| store_versions_build_entry(build) }
+  latest_release = released.nil? ? nil : store_versions_highest_version(released)
+
+  store_versions_ios_state(
+    builds_problem || released_problem ? "unavailable" : "ok",
+    store_versions_ios_detail(entries, latest_release, builds_problem, released_problem),
+    latest_release: latest_release,
+    builds: entries
+  )
+end
+
+# One store read, as [value, nil] or [nil, error]. Never as an empty answer: an
+# empty list is a fact about the store and a failure is not, and this whole
+# report exists to keep those two apart.
+#
+# Timeout::Error is re-raised rather than captured, because the deadline belongs
+# to the section, not to one read — swallowing it here would start the next read
+# with the budget already spent.
+def store_versions_read
+  [yield, nil]
+rescue Timeout::Error
+  raise
+rescue StandardError => e
+  [nil, e]
+end
+
+# Why one half of the iOS report has no answer, as a redacted fragment, or nil
+# when it does have one.
+def store_versions_problem(value, error, timed_out, seconds)
+  return nil unless value.nil?
+  return store_versions_safe_message(error.message) if error
+
+  timed_out ? "no answer within #{seconds} seconds" : "the read did not complete"
+end
+
+def store_versions_build_entry(build)
+  {
+    "version" => store_versions_value(build.app_version),
+    "build" => store_versions_build_number(build.version),
+    "state" => store_versions_value(build.processing_state)
+  }
+end
+
+def store_versions_value(value)
+  text = value.to_s.strip
+  text.empty? ? nil : text
+end
+
+# CFBundleVersion is a string and Apple accepts dotted forms such as "1.2.3".
+# The contract wants a number or null, and inventing 1 out of "1.2.3" would be a
+# fabricated build number in a report whose whole purpose is avoiding a wrong
+# one — so anything that is not a plain integer is reported as null.
+def store_versions_build_number(value)
+  text = value.to_s.strip
+  text.match?(/\A\d+\z/) ? text.to_i : nil
+end
+
+def store_versions_highest_version(versions)
+  cleaned = Array(versions).map { |v| v.to_s.strip }.reject(&:empty?)
+  return nil if cleaned.empty?
+
+  # Segment-wise, so 2.0.10 beats 2.0.9 — a plain string sort gets that backwards.
+  cleaned.max_by { |v| (v.split(".").map(&:to_i) + [0, 0, 0, 0]).first(4) }
+end
+
+# One sentence with one clause per half, so a partial answer says which half is
+# missing instead of presenting the half it has as the whole truth.
+def store_versions_ios_detail(entries, latest_release, builds_problem = nil, released_problem = nil)
+  testflight =
+    if builds_problem
+      "Could not read App Store Connect's TestFlight builds (#{builds_problem})"
+    elsif entries.empty?
+      "TestFlight has no builds for this app yet"
+    else
+      newest = entries.first
+      version = newest["version"] || "an unnamed version"
+      state = newest["state"] || "unknown"
+      if newest["build"]
+        "TestFlight's newest upload is build #{newest['build']} of version #{version}, state #{state}"
+      else
+        "TestFlight's newest upload is a build of version #{version} whose build number is not a " \
+          "plain integer, state #{state}"
+      end
+    end
+
+  released =
+    if released_problem
+      # NEVER "nothing has been released" here. A read that failed says nothing
+      # about the App Store, and a user who believes it picks a version number
+      # that collides with one Apple already has.
+      "the App Store release list could not be read (#{released_problem})"
+    elsif latest_release
+      "the latest App Store release is #{latest_release}"
+    else
+      "nothing has been released on the App Store yet"
+    end
+
+  "#{testflight}; #{released}."
 end
