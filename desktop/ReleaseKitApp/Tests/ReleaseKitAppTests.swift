@@ -2022,6 +2022,26 @@ final class ReleaseKitAppTests: XCTestCase {
         XCTAssertEqual(ActivityPanel.displayText(for: line), line)
     }
 
+    // Every upload label — the button, the confirmation, and the tooltip — is built from
+    // this one mapping, because a release_kit.yml onboarded onto alpha or beta must not
+    // read "Internal" anywhere: that's not a wording nit, it names the wrong destination.
+    func testPlayTrackDisplayNameUsesTheConsolesCurrentNamesForAlphaAndBeta() {
+        XCTAssertEqual(ProjectDetailView.playTrackDisplayName("alpha"), "Closed Testing")
+        XCTAssertEqual(ProjectDetailView.playTrackDisplayName("beta"), "Open Testing")
+    }
+
+    func testPlayTrackDisplayNameDefaultsToInternalForNilOrTheExplicitValue() {
+        XCTAssertEqual(ProjectDetailView.playTrackDisplayName("internal"), "Internal Testing")
+        XCTAssertEqual(ProjectDetailView.playTrackDisplayName(nil), "Internal Testing")
+    }
+
+    // The Fastfile already refuses to upload anything outside internal/alpha/beta, so this
+    // can only reach the UI via a hand-edited release_kit.yml. It should read back exactly
+    // what's actually configured rather than mislabel it as a track it is not.
+    func testPlayTrackDisplayNameEchoesAnUnrecognizedTrackInsteadOfMislabelingIt() {
+        XCTAssertEqual(ProjectDetailView.playTrackDisplayName("production"), "Production")
+    }
+
     @MainActor
     func testClearActivityAlsoClearsThePinnedErrorLine() {
         let model = AppModel(clientFactory: { _ in FakeFRKClient() })

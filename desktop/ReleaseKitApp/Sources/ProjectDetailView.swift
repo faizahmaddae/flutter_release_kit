@@ -788,7 +788,7 @@ struct ProjectDetailView: View {
         case .android:
             Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 8) {
                 detailRow("Application ID", project.android?.packageId ?? "Not detected")
-                detailRow("Play track", project.android?.track ?? "internal")
+                detailRow("Play track", Self.playTrackDisplayName(project.android?.track))
                 detailRow("Upload key", project.android?.signingReady == true ? "Validated and ready" : "Needs setup")
             }
         case .ios:
@@ -857,8 +857,25 @@ struct ProjectDetailView: View {
         model.startRelease(project: project.id, platforms: platforms)
     }
 
+    /// `android.track` in release_kit.yml is chosen once at onboarding — internal (the
+    /// default), alpha, or beta — and every label naming the upload destination has to
+    /// track it. Getting this wrong doesn't just misinform: the button would go on
+    /// saying "Internal" after someone onboarded onto alpha or beta, which reads as the
+    /// release going somewhere it didn't. `alpha`/`beta` are Play's API-era names; the
+    /// Play Console itself has called them Closed/Open testing for years, so that's what
+    /// ships here.
+    static func playTrackDisplayName(_ track: String?) -> String {
+        switch track {
+        case nil, "internal": "Internal Testing"
+        case "alpha": "Closed Testing"
+        case "beta": "Open Testing"
+        case let other?: other.capitalized
+        }
+    }
+
     private func releaseButtonTitle(_ platform: PlatformKind) -> String {
-        platform == .android ? "Upload to Play Internal" : "Upload to TestFlight"
+        guard platform == .android else { return "Upload to TestFlight" }
+        return "Upload to Play \(Self.playTrackDisplayName(project?.android?.track))"
     }
 
     private func confirmationButtonTitle(_ platforms: [PlatformKind]) -> String {
@@ -869,7 +886,9 @@ struct ProjectDetailView: View {
     /// two platforms no longer share a build number and can differ in name too.
     private func releaseConfirmation(_ platforms: [PlatformKind]) -> String {
         let lines = platforms.map { platform -> String in
-            let destination = platform == .android ? "Google Play's internal testing track" : "Apple TestFlight"
+            let destination = platform == .android
+                ? "Google Play's \(Self.playTrackDisplayName(project?.android?.track).lowercased()) track"
+                : "Apple TestFlight"
             return "\(platform.title) \(model.buildName(for: platform)) (build \(model.buildNumber(for: platform))) will be built and uploaded to \(destination)."
         }
         let notAtomic = platforms.count > 1
@@ -916,7 +935,7 @@ struct ProjectDetailView: View {
 
     private func releaseHelp(_ request: FRKRunRequest, platform: PlatformKind) -> String {
         let destination = platform == .android
-            ? "Google Play internal testing"
+            ? "Google Play \(Self.playTrackDisplayName(project?.android?.track).lowercased())"
             : "Apple TestFlight"
         let availability = storeCredentialsConfigured(for: platform)
             ? ""

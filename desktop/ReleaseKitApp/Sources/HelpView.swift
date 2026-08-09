@@ -62,8 +62,8 @@ struct HelpView: View {
                 )
                 helpRow(
                     icon: "arrow.up.circle.fill",
-                    title: "Upload to Play Internal / Upload to TestFlight",
-                    detail: "Builds fresh and publishes it to your testers on that store's testing track, in one step. A confirmation appears first."
+                    title: "Upload",
+                    detail: "Builds fresh and publishes it to your testers in one step. For Android, that's whichever Play track this project was set up with — internal, closed, or open testing, shown above as \"Play track\"; for iOS it's always TestFlight. A confirmation appears first."
                 )
 
                 Text("Upload is the only button you actually need — it builds for you. Build and Validate exist for when you want to check something first without shipping it.")
