@@ -225,6 +225,34 @@ A platform not in `platforms` reports `"configured": false` with empty lists,
 and `set-build-args` for that platform is `invalid_platform` rather than
 silently writing a section the app does not use.
 
+## Google Play track
+
+```bash
+frk api set-track example_app --track alpha
+```
+
+Changes which Google Play testing track this project's Android uploads go
+to: `internal` (the default), `alpha`, or `beta` — Play Console's own
+current names for these are Internal testing, Closed testing, and Open
+testing. `production` is not a valid value here or anywhere else in FRK;
+the Fastfile refuses it at upload time regardless of what reaches it.
+
+There is no read-only counterpart: the current track is already part of
+every project record `api project`/`api projects` return, at
+`android.track`. `set-track` returns that same record — read back from the
+file rather than assumed — so a client can update its state from one write
+instead of reloading the whole fleet.
+
+```json
+{"protocolVersion":1,"cliVersion":"0.8.0","project":{"id":"example_app","name":"example_app","path":"/Users/dev/flutter/example_app","exists":true,"onboarded":true,"state":"ready","platforms":["android","ios"],"version":"1.2.0+42","buildName":"1.2.0","buildNumber":42,"android":{"packageId":"com.example.app","signingReady":true,"track":"alpha"},"ios":{"bundleId":"com.example.app","teamId":"ABCDE12345","profilePath":"/Users/dev/.flutter-release/asc/profile.mobileprovision","profileReady":true,"distributionIdentityReady":true,"signingReady":true},"artifacts":{"androidAab":null,"iosIpa":null},"addedAt":"2026-01-15T10:00:00+00:00"}}
+```
+
+Edits only the one `track:` line under `android:` in the project's
+`release_kit.yml`; every other line is preserved byte for byte. Local and
+instant: no network, no fastlane, no build.
+
+A project not configured for Android is `invalid_platform`.
+
 ## Streaming actions
 
 ```bash
@@ -345,18 +373,19 @@ whose `code` and `message` are top-level event fields, not a nested object.
 
 | Code | Emitted by | Meaning |
 |---|---|---|
-| `project_not_found` | `api project`, `api setup`, `api store-versions`, `api build-args`, `api set-build-args` | The named project or path is not in the opt-in registry |
+| `project_not_found` | `api project`, `api setup`, `api store-versions`, `api build-args`, `api set-build-args`, `api set-track` | The named project or path is not in the opt-in registry |
 | `invalid_credentials` | `api configure-credentials` | The source file is missing or failed validation, or a different vault copy exists and `--force` was not supplied |
 | `credential_vault_unavailable` | `api configure-credentials` | The chosen file is fine but `~/.flutter-release` could not be written — distinct from `invalid_credentials` so a client can tell "pick another file" from "fix the vault" |
 | `invalid_request` | `api run` | The action and arguments cannot be mapped to a command: a missing project or `--platform`, or `validate` with a non-Android platform |
 | `stream_failed` | `api run` | Reading the child's output raised, or `frk` was signalled. Emitted after `started`; the child's process group is killed and `finished` follows with `success: false` |
-| `project_unavailable` | `api store-versions`, `api build-args`, `api set-build-args` | The registered project directory no longer exists |
+| `project_unavailable` | `api store-versions`, `api build-args`, `api set-build-args`, `api set-track` | The registered project directory no longer exists |
 | `project_not_onboarded` | `api store-versions` | The project has no shared Fastfile import or release configuration |
 | `fastlane_unavailable` | `api store-versions` | fastlane is not on `PATH`, or the child process could not be started |
 | `store_query_timed_out` | `api store-versions` | The lane did not finish within 300 seconds of being started and was stopped |
 | `store_query_failed` | `api store-versions` | The lane produced no report line |
 | `store_report_unreadable` | `api store-versions` | The report line is not a JSON object |
 | `invalid_platform` | `api set-build-args` | The project does not have the given `--platform` in `platforms` |
+| `invalid_platform` | `api set-track` | The project is not configured for Android |
 | `command_failed` | Any document command | The command exited through a handled diagnostic; the sentence is on stderr |
 | `internal_error` | Any document command | An unhandled exception escaped the command body |
 
@@ -379,6 +408,7 @@ them per command.
 | `api store-versions` | A report was returned, whatever the per-platform statuses say | Any of its error codes; nothing was read | — |
 | `api build-args` | Document returned | `project_not_found`, `project_unavailable` | — |
 | `api set-build-args` | The list was written (or was already what was asked for) | `project_not_found`, `project_unavailable`, `invalid_platform` | — |
+| `api set-track` | The track was written (or was already what was asked for) | `project_not_found`, `project_unavailable`, `invalid_platform` | — |
 | `api configure-credentials` | Store configured | `invalid_credentials` | — |
 | `api run` | The action succeeded | The action ran and failed | `invalid_request` |
 

@@ -63,6 +63,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var buildArgs: BuildArgsResponse?
     @Published private(set) var isLoadingBuildArgs = false
     @Published private(set) var isSavingBuildArgs = false
+    @Published private(set) var isSavingTrack = false
     @Published private(set) var buildArgsError: String?
     @Published var errorMessage: String?
     @Published var showAddProject = false
@@ -362,6 +363,24 @@ final class AppModel: ObservableObject {
             buildArgs = try await client.setBuildArgs(projectID, platform: platform, args: args)
         } catch {
             buildArgsError = error.localizedDescription
+        }
+    }
+
+    /// Replaces the matching project's entry with the one `set-track` just wrote and
+    /// read back, so every place reading `project.android?.track` — the button, its
+    /// confirmation, its tooltip — updates from one write instead of each needing its
+    /// own refresh call. A project not currently in `projects` (removed mid-request) is
+    /// left alone rather than appended back.
+    func setTrack(for projectID: String, track: String) async {
+        isSavingTrack = true
+        defer { isSavingTrack = false }
+        do {
+            let response = try await client.setTrack(projectID, track: track)
+            if let index = projects.firstIndex(where: { $0.id == projectID }) {
+                projects[index] = response.project
+            }
+        } catch {
+            errorMessage = error.localizedDescription
         }
     }
 

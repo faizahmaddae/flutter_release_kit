@@ -3397,6 +3397,46 @@ final class ReleaseKitAppTests: XCTestCase {
     }
 
     @MainActor
+    func testSetTrackReplacesTheMatchingProjectFromTheResponseAndLeavesOthersAlone() async throws {
+        var fake = FakeFRKClient(projectsResponse: Self.projectsResponse([
+            Self.projectSummary(id: "apple", name: "apple", track: "internal"),
+            Self.projectSummary(id: "pear", name: "pear", track: "internal"),
+        ]))
+        fake.setTrackResponse = ProjectDocument(
+            protocolVersion: 1, cliVersion: "0.8.0",
+            project: Self.projectSummary(id: "apple", name: "apple", track: "beta")
+        )
+        let model = AppModel(clientFactory: { _ in fake })
+        try await model.reloadProjects()
+
+        await model.setTrack(for: "apple", track: "beta")
+
+        // Read back from the response, not assembled locally.
+        XCTAssertEqual("beta", model.projects.first { $0.id == "apple" }?.android?.track)
+        XCTAssertEqual("internal", model.projects.first { $0.id == "pear" }?.android?.track)
+        XCTAssertEqual(["apple/beta"], fake.setTrackCalls.recorded)
+        XCTAssertFalse(model.isSavingTrack)
+        XCTAssertNil(model.errorMessage)
+    }
+
+    @MainActor
+    func testSetTrackFailureLeavesTheProjectUnchangedAndSurfacesAnError() async throws {
+        let fake = FakeFRKClient(projectsResponse: Self.projectsResponse([
+            Self.projectSummary(id: "apple", name: "apple", track: "internal"),
+        ]))
+        // setTrackResponse left nil: the fake throws FakeFRKClient.failureMessage.
+        let model = AppModel(clientFactory: { _ in fake })
+        try await model.reloadProjects()
+
+        await model.setTrack(for: "apple", track: "beta")
+
+        // A failed write must not make the UI show a track that was never saved.
+        XCTAssertEqual("internal", model.projects.first { $0.id == "apple" }?.android?.track)
+        XCTAssertNotNil(model.errorMessage)
+        XCTAssertFalse(model.isSavingTrack)
+    }
+
+    @MainActor
     func testLoadBuildArgsFailureClearsAnyPreviousBuildArgsAndSurfacesAnError() async throws {
         // Unlike a failed write, a failed LOAD has nothing trustworthy to keep: the
         // value on screen might belong to a config that no longer parses, so it is
@@ -3549,6 +3589,9 @@ final class ReleaseKitAppTests: XCTestCase {
         /// Records "<projectID>/<platform>/<arg1>|<arg2>..." per call, so a test can
         /// assert both which platform was written and exactly what was sent.
         var setBuildArgsCalls = CallCounter()
+        var setTrackResponse: ProjectDocument?
+        /// Records "<projectID>/<track>" per call.
+        var setTrackCalls = CallCounter()
 
         func capabilities() async throws -> CapabilitiesResponse {
             try Self.unwrap(capabilitiesResponse)
@@ -3570,6 +3613,11 @@ final class ReleaseKitAppTests: XCTestCase {
         func setBuildArgs(_ id: String, platform: PlatformKind, args: [String]) async throws -> BuildArgsResponse {
             setBuildArgsCalls.record("\(id)/\(platform.rawValue)/\(args.joined(separator: "|"))")
             return try Self.unwrap(setBuildArgsResponse)
+        }
+
+        func setTrack(_ id: String, track: String) async throws -> ProjectDocument {
+            setTrackCalls.record("\(id)/\(track)")
+            return try Self.unwrap(setTrackResponse)
         }
 
         func projects() async throws -> ProjectsResponse {
@@ -3662,7 +3710,8 @@ final class ReleaseKitAppTests: XCTestCase {
         name: String,
         buildName: String? = nil,
         buildNumber: Int? = nil,
-        platforms: [PlatformKind] = [.android]
+        platforms: [PlatformKind] = [.android],
+        track: String = "internal"
     ) -> ProjectSummary {
         ProjectSummary(
             id: id,
@@ -3675,7 +3724,7 @@ final class ReleaseKitAppTests: XCTestCase {
             version: buildNumber.map { "\(buildName ?? "")+\($0)" },
             buildName: buildName,
             buildNumber: buildNumber,
-            android: AndroidSummary(packageId: "org.example.\(id)", signingReady: true, track: "internal"),
+            android: AndroidSummary(packageId: "org.example.\(id)", signingReady: true, track: track),
             ios: nil,
             artifacts: ArtifactSummary(androidAab: nil, iosIpa: nil),
             addedAt: nil

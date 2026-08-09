@@ -788,7 +788,7 @@ struct ProjectDetailView: View {
         case .android:
             Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 8) {
                 detailRow("Application ID", project.android?.packageId ?? "Not detected")
-                detailRow("Play track", Self.playTrackDisplayName(project.android?.track))
+                androidTrackRow(project)
                 detailRow("Upload key", project.android?.signingReady == true ? "Validated and ready" : "Needs setup")
             }
         case .ios:
@@ -798,6 +798,46 @@ struct ProjectDetailView: View {
                 detailRow("Provisioning", project.ios?.profileReady == true ? "Profile ready" : "Needs setup")
             }
         }
+    }
+
+    private static let androidTracks = ["internal", "alpha", "beta"]
+
+    /// The only editable row among Application ID / Play track / Upload key: the other
+    /// two describe facts about the project FRK detected, this one is a setting FRK
+    /// wrote at onboarding and can rewrite the same way. Applies as soon as a track is
+    /// picked — matching every other setting on this screen, from the build-name fields
+    /// to Extra build flags, none of which sit behind a separate Save button.
+    @ViewBuilder
+    private func androidTrackRow(_ project: ProjectSummary) -> some View {
+        GridRow {
+            Text("Play track")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 105, alignment: .leading)
+            HStack(spacing: 8) {
+                Picker("Play track", selection: androidTrackBinding(project)) {
+                    ForEach(Self.androidTracks, id: \.self) { track in
+                        Text(Self.playTrackDisplayName(track)).tag(track)
+                    }
+                }
+                .labelsHidden()
+                .frame(maxWidth: 200)
+                .disabled(model.isSavingTrack || model.isRunning)
+                if model.isSavingTrack {
+                    ProgressView().controlSize(.small)
+                }
+            }
+            .help("Which Google Play testing track future uploads for this project go to. Writes to release_kit.yml immediately; nothing is uploaded by changing it.")
+        }
+    }
+
+    private func androidTrackBinding(_ project: ProjectSummary) -> Binding<String> {
+        Binding(
+            get: { project.android?.track ?? "internal" },
+            set: { newTrack in
+                Task { await model.setTrack(for: project.id, track: newTrack) }
+            }
+        )
     }
 
     @ViewBuilder

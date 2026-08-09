@@ -98,6 +98,15 @@ struct ProjectsResponse: Codable, Equatable {
     let projects: [ProjectSummary]
 }
 
+/// What `api set-track` returns: the one project it just wrote, read back from disk
+/// rather than assumed, so the model can replace its matching entry directly instead
+/// of reloading the whole fleet for a one-file change.
+struct ProjectDocument: Codable, Equatable {
+    let protocolVersion: Int
+    let cliVersion: String
+    let project: ProjectSummary
+}
+
 struct APIErrorPayload: Codable, Equatable {
     let code: String
     let message: String

@@ -39,6 +39,8 @@ protocol FRKClientProtocol: Sendable {
     /// Replaces `platform`'s OWN extra build flags; an empty `args` clears them. Never
     /// touches the shared (top-level) list, which stays a hand-edited YAML setting.
     func setBuildArgs(_ id: String, platform: PlatformKind, args: [String]) async throws -> BuildArgsResponse
+    /// Local and instant, like setBuildArgs: rewrites one YAML scalar, no fastlane.
+    func setTrack(_ id: String, track: String) async throws -> ProjectDocument
     func configureGooglePlay(file: URL, force: Bool) async throws -> CredentialsResponse
     func configureAppStore(
         file: URL,
@@ -126,6 +128,10 @@ struct FRKClient: FRKClientProtocol {
             arguments.append(contentsOf: ["--arg", arg])
         }
         return try await runJSON(arguments: arguments)
+    }
+
+    func setTrack(_ id: String, track: String) async throws -> ProjectDocument {
+        try await runJSON(arguments: ["api", "set-track", id, "--track", track])
     }
 
     func runJSON<T: Decodable>(arguments: [String]) async throws -> T {

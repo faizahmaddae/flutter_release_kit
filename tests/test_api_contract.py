@@ -253,6 +253,23 @@ class APIContractTestCase(unittest.TestCase):
     def test_project_api_record_keys_match_the_golden_contract(self):
         self.assertEqual(key_map(self.build_project_record()), self.golden("project_api_record"))
 
+    def build_set_track_response(self):
+        """`set-track` wraps the same project_api_record `project` already returns,
+        rather than inventing a shape of its own — this proves that reuse holds by
+        running the real write end to end instead of asserting it against the
+        builder in isolation."""
+        frk.register_project(self.app)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            status = frk.cmd_api_set_track(argparse.Namespace(app_dir="contract_app", track="beta"))
+        self.assertEqual(0, status, "a valid track on a dual-platform project must produce a document, not an error")
+        return json.loads(stdout.getvalue())
+
+    def test_api_set_track_response_matches_the_project_record_contract(self):
+        response = self.build_set_track_response()
+        self.assertEqual("beta", response["project"]["android"]["track"])
+        self.assertEqual(key_map(response["project"]), self.golden("project_api_record"))
+
     def test_setup_status_record_keys_match_the_golden_contract(self):
         self.assertEqual(key_map(self.build_setup_record()), self.golden("setup_status_record"))
 

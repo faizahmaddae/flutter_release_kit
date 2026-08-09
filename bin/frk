@@ -69,12 +69,17 @@ API_RUN_ACTIONS = (
 API_DOCUMENT_COMMANDS = (
     "capabilities", "projects", "project", "setup",
     "credentials", "configure-credentials", "store-versions",
-    "build-args", "set-build-args",
+    "build-args", "set-build-args", "set-track",
 )
 # Exit code for "the CLI itself failed", kept distinct from the codes a child
 # release command can return so a client can tell the two apart.
 API_INTERNAL_EXIT = 70
 CONFIG_NAME = "fastlane/release_kit.yml"
+# Play's testing tracks, in the order onboarding's --track help text lists them.
+# `production` is deliberately absent: the Fastfile refuses it at upload time
+# regardless of what reaches this list, but keeping it out of the choice set
+# means a typo is caught here instead of after a build.
+ANDROID_TRACKS = ("internal", "alpha", "beta")
 # Wall-clock ceiling for the Git exposure checks. Deliberately the generous one:
 # those answers decide whether a signing secret is sitting in a repository, and a
 # premature "not tracked" or "not ignored" silently weakens that guard — worse
@@ -493,6 +498,55 @@ def set_platform_extra_build_args(app: Path, platform: str, args: list[str]) -> 
             insert_at -= 1
         prefix = [""] if insert_at > section_start + 1 and lines[insert_at - 1].strip() != "" else []
         lines[insert_at:insert_at] = prefix + new_block
+
+    new_text = "\n".join(lines)
+    if trailing_newline or new_text:
+        new_text += "\n"
+    if new_text == text:
+        return
+
+    temp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    temp.write_text(new_text, encoding="utf-8")
+    try:
+        temp.chmod(path.stat().st_mode & 0o777)
+    except OSError:
+        pass
+    os.replace(temp, path)
+
+
+def set_android_track(app: Path, track: str) -> None:
+    """Rewrites only android's `track:` scalar, preserving every other line —
+    comments, spacing, extra_build_args, and the ios section — byte for byte.
+    Setting the value already in place is a true no-op: the file is not
+    touched, and its mtime does not change. Callers are expected to have
+    validated `track` against ANDROID_TRACKS already; this only knows how to
+    write whatever string it is given.
+    """
+    path = app / CONFIG_NAME
+    text = read(path)
+    lines = text.splitlines()
+    trailing_newline = text.endswith("\n")
+
+    section = find_top_level_yaml_block(lines, "android")
+    if section is None:
+        die(f"{path}: no `android:` section — is this project onboarded for android?")
+    start, end = section
+
+    line_index = None
+    for i in range(start + 1, end):
+        if re.match(r"^[ \t]+track:[ \t]*", lines[i]):
+            line_index = i
+            break
+
+    new_line = f"  track: {track}"
+    if line_index is not None:
+        if lines[line_index] == new_line:
+            return
+        lines[line_index] = new_line
+    else:
+        # Every onboarded android section carries a track line; this only
+        # covers a config edited by hand after the fact to drop it.
+        lines[start + 1 : start + 1] = [new_line]
 
     new_text = "\n".join(lines)
     if trailing_newline or new_text:
@@ -2453,6 +2507,26 @@ def cmd_api_set_build_args(args) -> int:
     return 0
 
 
+def cmd_api_set_track(args) -> int:
+    entry, app = api_find_project_dir(args.app_dir)
+    if not entry:
+        return api_error("project_not_found", f"No managed project named or located at {args.app_dir}")
+    if not app:
+        return api_error("project_unavailable", f"The managed project directory is missing: {entry.get('path')}")
+    _, platforms = config_summary(app)
+    if "android" not in platforms:
+        return api_error(
+            "invalid_platform",
+            f"{entry.get('name') or app.name} is not configured for android",
+        )
+    set_android_track(app, args.track)
+    # Same shape `api project` returns, so a client can reuse one decoder for
+    # both: the value just written is read back from the file rather than
+    # assumed, the same way build-args reports back what set-build-args wrote.
+    api_print(project=project_api_record(entry))
+    return 0
+
+
 def cmd_api_credentials(args) -> int:
     api_print(**credential_status_record())
     return 0
@@ -3400,6 +3474,28 @@ def cmd_build_args_set(args) -> int:
     return 0
 
 
+def cmd_track_show(args) -> int:
+    """Print the Google Play testing track this project uploads to."""
+    app = require_managed_app(args.app_dir)
+    _, platforms = config_summary(app)
+    if "android" not in platforms:
+        die(f"{app.name} is not configured for android")
+    head(f"{app.name}: Play track")
+    info(config_setting(app, "track") or "internal")
+    return 0
+
+
+def cmd_track_set(args) -> int:
+    """Change the Google Play testing track this project uploads to."""
+    app = require_managed_app(args.app_dir)
+    _, platforms = config_summary(app)
+    if "android" not in platforms:
+        die(f"{app.name} is not configured for android")
+    set_android_track(app, args.track)
+    ok(f"android.track set to: {args.track}")
+    return 0
+
+
 # --------------------------------------------------------------------------- #
 # machine setup and status commands
 # --------------------------------------------------------------------------- #
@@ -3600,7 +3696,7 @@ def main() -> int:
     ob.add_argument("--android-package", help="explicit applicationId when Gradle computes it dynamically")
     ob.add_argument("--ios-bundle-id", help="explicit bundle id when Xcode detection is insufficient")
     ob.add_argument("--ios-team-id", help="explicit Apple Developer team id")
-    ob.add_argument("--track", default="internal", choices=["internal", "alpha", "beta"],
+    ob.add_argument("--track", default="internal", choices=list(ANDROID_TRACKS),
                     help="Play testing track (default: internal)")
     ob.add_argument("--force", action="store_true", help="overwrite existing files")
     ob.add_argument("--dry-run", action="store_true", help="show what would change")
@@ -3706,6 +3802,11 @@ def main() -> int:
     )
     api_set_build_args.set_defaults(func=cmd_api_set_build_args, api_document_command=True)
 
+    api_set_track = api_sub.add_parser("set-track", help="change the Google Play testing track")
+    api_set_track.add_argument("app_dir", help="path or managed app name")
+    api_set_track.add_argument("--track", required=True, choices=list(ANDROID_TRACKS))
+    api_set_track.set_defaults(func=cmd_api_set_track, api_document_command=True)
+
     api_run = api_sub.add_parser("run", help="run one stable action and stream JSON Lines events")
     api_run.add_argument("action", choices=list(API_RUN_ACTIONS))
     api_run.add_argument("app_dir", nargs="?", help="path or managed app name")
@@ -3719,7 +3820,7 @@ def main() -> int:
     api_run.add_argument("--android-package", help="onboard: explicit Android applicationId")
     api_run.add_argument("--ios-bundle-id", help="onboard: explicit iOS bundle identifier")
     api_run.add_argument("--ios-team-id", help="onboard: explicit Apple developer team id")
-    api_run.add_argument("--track", choices=["internal", "alpha", "beta"])
+    api_run.add_argument("--track", choices=list(ANDROID_TRACKS))
     api_run.add_argument("--properties", help="signing-import: source key.properties")
     api_run.add_argument("--keystore", help="signing-import: selected .jks or .keystore")
     api_run.add_argument("--force", action="store_true", help="signing-import: replace a different vault copy")
@@ -3769,6 +3870,18 @@ def main() -> int:
         help="one flag, e.g. --dart-define=KEY=value; repeat for more; omit entirely to clear",
     )
     bg_set.set_defaults(func=cmd_build_args_set)
+
+    tr = sub.add_parser("track", help="view or change the Google Play testing track")
+    tr_sub = tr.add_subparsers(dest="track_cmd", required=True)
+
+    tr_show = tr_sub.add_parser("show", help="print the configured Play track")
+    tr_show.add_argument("app_dir", nargs="?", default=".", help="path or managed app name")
+    tr_show.set_defaults(func=cmd_track_show)
+
+    tr_set = tr_sub.add_parser("set", help="change the Play track")
+    tr_set.add_argument("app_dir", nargs="?", default=".", help="path or managed app name")
+    tr_set.add_argument("track", choices=list(ANDROID_TRACKS))
+    tr_set.set_defaults(func=cmd_track_set)
 
     args = p.parse_args()
     # Only the command body is wrapped: argparse's own usage errors keep their

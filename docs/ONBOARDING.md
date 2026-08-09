@@ -148,6 +148,9 @@ Useful options:
 | `--track alpha` | Select `alpha` instead of the default `internal` Play track |
 | `--force` | Replace generated configuration after review |
 
+The track chosen here is not permanent: `frk track show`/`frk track set` (or
+the desktop app's Play track picker) change it later without re-onboarding.
+
 ### Projects in nested directories
 
 The registry stores the full project path, so nested projects work without

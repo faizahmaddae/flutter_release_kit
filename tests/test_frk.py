@@ -642,6 +642,109 @@ class FrkTestCase(unittest.TestCase):
         self.assertEqual([], json.loads(self.stdout.getvalue())["android"]["own"])
         self.assertEqual([], frk.platform_extra_build_args(app, "android"))
 
+    # ----------------------------------------------------------------- #
+    # android.track — pure patcher
+    # ----------------------------------------------------------------- #
+    def test_set_android_track_replaces_the_scalar_and_leaves_everything_else_untouched(self):
+        app = self.write_extra_args_sample()
+        before = (app / frk.CONFIG_NAME).read_text()
+
+        frk.set_android_track(app, "beta")
+
+        after = (app / frk.CONFIG_NAME).read_text()
+        self.assertIn("  track: beta", after)
+        self.assertNotIn("track: internal", after)
+        self.assertEqual(before[before.index("ios:") :], after[after.index("ios:") :])
+
+    def test_set_android_track_is_idempotent(self):
+        app = self.write_extra_args_sample()
+        frk.set_android_track(app, "alpha")
+        once = (app / frk.CONFIG_NAME).read_text()
+        once_mtime = (app / frk.CONFIG_NAME).stat().st_mtime_ns
+
+        frk.set_android_track(app, "alpha")
+
+        self.assertEqual(once, (app / frk.CONFIG_NAME).read_text())
+        self.assertEqual(once_mtime, (app / frk.CONFIG_NAME).stat().st_mtime_ns)
+
+    def test_set_android_track_dies_without_an_android_section(self):
+        app = self.write_extra_args_sample(
+            text=self.EXTRA_ARGS_SAMPLE.replace("platforms: [android, ios]", "platforms: [ios]").split("android:")[0]
+            + 'ios:\n  bundle_id: org.example.app\n  team_id: ABCDE12345\n'
+        )
+        with self.assertRaises(SystemExit):
+            frk.set_android_track(app, "beta")
+
+    def test_set_android_track_inserts_a_line_when_the_config_has_none(self):
+        # A config hand-edited to drop the track key entirely — not what onboarding
+        # writes, but the setter has to leave the file sane either way.
+        app = self.write_extra_args_sample(
+            text=self.EXTRA_ARGS_SAMPLE.replace("  track: internal\n\n", "")
+        )
+        self.assertNotIn("track:", (app / frk.CONFIG_NAME).read_text())
+
+        frk.set_android_track(app, "alpha")
+
+        self.assertEqual("alpha", frk.config_setting(app, "track"))
+
+    # ----------------------------------------------------------------- #
+    # android.track — human CLI
+    # ----------------------------------------------------------------- #
+    def test_track_show_reports_the_configured_track(self):
+        app = self.onboard_dual_platform_app("trshow", "org.example.trshow", "org.example.trshow.ios", "ABCDE12345")
+
+        self.assertEqual(0, frk.cmd_track_show(argparse.Namespace(app_dir=str(app))))
+        self.assertIn("internal", self.stdout.getvalue())
+
+    def test_track_set_writes_and_show_reflects_it(self):
+        app = self.onboard_dual_platform_app("trset", "org.example.trset", "org.example.trset.ios", "ABCDE12345")
+
+        exit_code = frk.cmd_track_set(argparse.Namespace(app_dir=str(app), track="beta"))
+        self.assertEqual(0, exit_code)
+        self.assertEqual("beta", frk.config_setting(app, "track"))
+
+        self.reset_stdout()
+        frk.cmd_track_show(argparse.Namespace(app_dir=str(app)))
+        self.assertIn("beta", self.stdout.getvalue())
+
+    def test_track_set_dies_for_an_ios_only_app(self):
+        app = self.onboard_dual_platform_app("trios", None, "org.example.trios.ios", "ABCDE12345")
+
+        with self.assertRaises(SystemExit):
+            frk.cmd_track_set(argparse.Namespace(app_dir=str(app), track="beta"))
+
+    # ----------------------------------------------------------------- #
+    # android.track — machine API
+    # ----------------------------------------------------------------- #
+    def test_api_set_track_writes_and_returns_the_updated_project_record(self):
+        app = self.onboard_dual_platform_app("trapiset", "org.example.trapiset", "org.example.trapiset.ios", "ABCDE12345")
+
+        self.reset_stdout()
+        exit_code = frk.cmd_api_set_track(argparse.Namespace(app_dir="trapiset", track="alpha"))
+
+        self.assertEqual(0, exit_code)
+        doc = json.loads(self.stdout.getvalue())
+        self.assertEqual({"protocolVersion", "cliVersion", "project"}, set(doc))
+        self.assertEqual("alpha", doc["project"]["android"]["track"])
+        # Persisted, not just echoed.
+        self.assertEqual("alpha", frk.config_setting(app, "track"))
+
+    def test_api_set_track_reports_invalid_platform_for_an_ios_only_app(self):
+        self.onboard_dual_platform_app("trapiiosonly", None, "org.example.trapiiosonly.ios", "ABCDE12345")
+
+        self.reset_stdout()
+        exit_code = frk.cmd_api_set_track(argparse.Namespace(app_dir="trapiiosonly", track="beta"))
+
+        self.assertEqual(1, exit_code)
+        self.assertEqual("invalid_platform", json.loads(self.stdout.getvalue())["error"]["code"])
+
+    def test_api_set_track_reports_project_not_found(self):
+        self.reset_stdout()
+        exit_code = frk.cmd_api_set_track(argparse.Namespace(app_dir="does-not-exist", track="beta"))
+
+        self.assertEqual(1, exit_code)
+        self.assertEqual("project_not_found", json.loads(self.stdout.getvalue())["error"]["code"])
+
     def test_quoted_config_name_with_a_trailing_comment_matches_ruby_yaml(self):
         # fastlane/Fastfile reads the same line with YAML.load_file, which keeps
         # the quoted scalar and drops the comment. Python must not disagree about
@@ -3651,7 +3754,7 @@ class FrkTestCase(unittest.TestCase):
             [
                 "capabilities", "projects", "project", "setup",
                 "credentials", "configure-credentials", "store-versions",
-                "build-args", "set-build-args", "run",
+                "build-args", "set-build-args", "set-track", "run",
             ],
             [name for name in api_commands if name not in advertised],
         )
