@@ -69,6 +69,7 @@ final class AppModel: ObservableObject {
     @Published var showSettings = false
     @Published var showCredentialOnboarding = false
     @Published var showScreenshotStudio = false
+    @Published var showHelp = false
     @Published var cliPath: String
 
     private var activeProcess: Process?

@@ -710,6 +710,11 @@ struct ProjectDetailView: View {
                     .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
                 }
 
+                Text(releaseStepsCaption(platform))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
                 ViewThatFits(in: .horizontal) {
                     HStack(spacing: 10) {
                         localPlatformActions(project, platform: platform)
@@ -882,6 +887,17 @@ struct ProjectDetailView: View {
     private func verifyHelp(_ project: ProjectSummary) -> String {
         let request = FRKRunRequest(action: .verify, project: project.id)
         return "Runs Flutter analysis and the project's tests. No release artifact is uploaded.\nCommand: \(request.commandPreview)"
+    }
+
+    /// The three buttons below read as three peers, but only one of them ships anything —
+    /// Upload builds for you. This is the one-line version of that; the Help window (⌘?)
+    /// has the long version.
+    private func releaseStepsCaption(_ platform: PlatformKind) -> String {
+        let upload = releaseButtonTitle(platform)
+        if platform == .android {
+            return "\(upload) is the only button you need — it builds and publishes in one step. Build only compiles; Validate checks Google Play without publishing."
+        }
+        return "\(upload) is the only button you need — it builds and publishes in one step. Build only compiles, nothing more. (Apple has no publish-free check, so there's no Validate here.)"
     }
 
     private func buildHelp(_ request: FRKRunRequest, platform: PlatformKind) -> String {

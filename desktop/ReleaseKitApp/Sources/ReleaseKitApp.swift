@@ -42,6 +42,13 @@ struct ReleaseKitApp: App {
                 .keyboardShortcut(".", modifiers: .command)
                 .help("Request a safe stop for the running FRK command and its child processes.")
             }
+
+            CommandGroup(replacing: .help) {
+                Button("Flutter Release Kit Help") {
+                    model.showHelp = true
+                }
+                .keyboardShortcut("?", modifiers: .command)
+            }
         }
 
         Settings {

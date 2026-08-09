@@ -114,6 +114,9 @@ struct RootView: View {
                     .environmentObject(model)
             }
         }
+        .sheet(isPresented: $model.showHelp) {
+            HelpView()
+        }
         .alert("Flutter Release Kit", isPresented: errorPresented) {
             Button("OK", role: .cancel) {
                 model.errorMessage = nil
