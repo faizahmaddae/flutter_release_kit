@@ -1,0 +1,35 @@
+# =============================================================================
+# {{APP_NAME}} — release automation
+# =============================================================================
+#
+# The lanes themselves live in the Flutter Release Kit and are shared by every
+# app, so a fix made once applies everywhere. Everything specific to this app is
+# data in fastlane/release_kit.yml — identifiers, platforms, track.
+#
+#   frk doctor                 Validate this app's whole release setup
+#   frk build android          Build the AAB without uploading
+#   frk release android        Upload to the Play testing track
+#   frk release ios            Upload to TestFlight
+#
+# Nothing here can publish to the public; promoting is a manual console step.
+#
+# Please do NOT add lanes to this file. If this app needs behaviour the kit
+# lacks, add it to the kit (guarded by config) so the other apps benefit too.
+# =============================================================================
+
+kit = File.expand_path(
+  ENV["FLUTTER_RELEASE_KIT"] || "~/.flutter-release-kit"
+)
+kit_fastfile = File.join(kit, "fastlane", "Fastfile")
+
+unless File.file?(kit_fastfile)
+  UI.user_error!(<<~MSG)
+    Flutter Release Kit not found at:
+      #{kit}
+
+    Clone or move the kit there, or point FLUTTER_RELEASE_KIT at it:
+      export FLUTTER_RELEASE_KIT=/path/to/flutter_release_kit
+  MSG
+end
+
+import kit_fastfile

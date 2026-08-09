@@ -1,0 +1,28 @@
+
+# ---------------------------------------------------------------------------
+# Flutter Release Kit — secrets. NEVER commit anything below.
+# ---------------------------------------------------------------------------
+# Per-app signing material and any credential that lands in the repo.
+/key/
+/keys/
+android/key.properties
+
+*.jks
+*.keystore
+*.p12
+*.p8
+*.pem
+*.cer
+*.certSigningRequest
+*.mobileprovision
+AuthKey_*.p8
+
+# Fastlane — release_kit.yml IS committed (identifiers only, no secrets).
+fastlane/.env
+fastlane/.env.*
+!fastlane/.env.example
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots
+fastlane/test_output
+fastlane/README.md

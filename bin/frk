@@ -1,0 +1,2630 @@
+#!/usr/bin/env python3
+"""frk — Flutter Release Kit CLI.
+
+Onboards explicitly selected Flutter apps onto shared release automation.
+Deliberately does NOT copy the Fastfile: each app gets a tiny importer plus a
+config file naming its own identifiers, so the shared lanes stay a single
+source of truth.
+
+  frk setup                        prepare this machine once
+  frk onboard [app-dir] [--name X] [--platforms android,ios]
+  frk doctor  [app-dir]            validate one managed app
+  frk build   android|ios|all      build release artifacts
+  frk release android|ios|all      upload to Play testing / TestFlight
+  frk list                         show only explicitly managed apps
+  frk signing audit [app-dir]      inspect Android signing safely
+
+Standard library only — no gems, no pip installs, no bundler.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import plistlib
+import re
+import signal
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+KIT_ROOT = Path(__file__).resolve().parent.parent
+TEMPLATES = KIT_ROOT / "templates"
+VERSION = "0.4.0"
+API_PROTOCOL_VERSION = 1
+CREDENTIALS_DIR = Path(os.environ.get("FLUTTER_RELEASE_HOME", "~/.flutter-release")).expanduser()
+CONFIG_NAME = "fastlane/release_kit.yml"
+IMPORT_MARKER = "import kit_fastfile"
+REGISTRY_PATH = CREDENTIALS_DIR / "projects.json"
+SIGNING_DIR = CREDENTIALS_DIR / "signing"
+REGISTRY_VERSION = 1
+ANDROID_SIGNING_KEYS = ("storeFile", "storePassword", "keyAlias", "keyPassword")
+
+CREDENTIALS_ENV_TEMPLATE = """# Flutter Release Kit shared credentials.
+# Uncomment only the platforms used on this machine.
+
+# App Store Connect API key (team-wide)
+# ASC_KEY_ID=XXXXXXXXXX
+# ASC_ISSUER_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+# ASC_KEY_FILEPATH=asc/AuthKey_XXXXXXXXXX.p8
+
+# Google Play service-account key
+# SUPPLY_JSON_KEY=play/service-account.json
+"""
+
+# Bundle/package ids that mean "never configured", not a real app.
+PLACEHOLDER_ID = re.compile(r"^com\.example\.|^com\.example$")
+ANDROID_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+$")
+IOS_BUNDLE_ID = re.compile(r"^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$")
+APPLE_TEAM_ID = re.compile(r"^[A-Z0-9]{10}$")
+ASC_KEY_ID_PATTERN = re.compile(r"^[A-Z0-9]{10}$")
+ASC_ISSUER_ID_PATTERN = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
+
+def real_android_id(value: str | None) -> bool:
+    return bool(value and ANDROID_ID.fullmatch(value) and not PLACEHOLDER_ID.match(value))
+
+
+def real_ios_identity(bundle_id: str | None, team_id: str | None) -> bool:
+    return bool(
+        bundle_id
+        and IOS_BUNDLE_ID.fullmatch(bundle_id)
+        and not PLACEHOLDER_ID.match(bundle_id)
+        and team_id
+        and APPLE_TEAM_ID.fullmatch(team_id)
+    )
+
+
+# --------------------------------------------------------------------------- #
+# output helpers
+# --------------------------------------------------------------------------- #
+def _c(code: str, text: str) -> str:
+    return text if not sys.stdout.isatty() else f"\033[{code}m{text}\033[0m"
+
+
+def ok(m):    print(f"  {_c('32', 'ok')}    {m}")
+def warn(m):  print(f"  {_c('33', 'warn')}  {m}")
+def fail(m):  print(f"  {_c('31', 'FAIL')}  {m}")
+def info(m):  print(f"        {m}")
+def head(m):  print(f"\n{_c('1', m)}")
+
+
+def die(msg: str, code: int = 1):
+    print(f"\n{_c('31', 'error')}: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# --------------------------------------------------------------------------- #
+# opt-in project registry
+# --------------------------------------------------------------------------- #
+def ensure_private_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    path.chmod(0o700)
+
+
+def load_registry() -> dict:
+    if not REGISTRY_PATH.is_file():
+        return {"version": REGISTRY_VERSION, "projects": []}
+    try:
+        data = json.loads(REGISTRY_PATH.read_text())
+    except (OSError, ValueError) as exc:
+        die(f"could not read registry {REGISTRY_PATH}: {exc}")
+    if not isinstance(data, dict) or not isinstance(data.get("projects"), list):
+        die(f"invalid project registry: {REGISTRY_PATH}")
+    if data.get("version", REGISTRY_VERSION) != REGISTRY_VERSION:
+        die(f"unsupported project registry version in {REGISTRY_PATH}")
+    if any(not isinstance(project, dict) or not project.get("path") for project in data["projects"]):
+        die(f"invalid project entry in registry: {REGISTRY_PATH}")
+    return data
+
+
+def save_registry(data: dict) -> None:
+    ensure_private_dir(CREDENTIALS_DIR)
+    data["version"] = REGISTRY_VERSION
+    temp = REGISTRY_PATH.with_suffix(".tmp")
+    temp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    temp.chmod(0o600)
+    temp.replace(REGISTRY_PATH)
+
+
+def parse_config_name(raw: str, fallback: str) -> str:
+    raw = raw.strip()
+    if raw.startswith('"'):
+        try:
+            value = json.loads(raw)
+            return str(value) if value else fallback
+        except (ValueError, TypeError):
+            return fallback
+    if raw.startswith("'") and raw.endswith("'"):
+        return raw[1:-1].replace("''", "'") or fallback
+    return raw.split(" #", 1)[0].strip() or fallback
+
+
+def config_summary(app: Path) -> tuple[str, list[str]]:
+    text = read(app / CONFIG_NAME)
+    name_match = re.search(r"^name:\s*(.+)$", text, re.M)
+    platforms_match = re.search(r"^platforms:\s*\[([^\]]*)\]", text, re.M)
+    name = parse_config_name(name_match.group(1), app.name) if name_match else app.name
+    platforms = []
+    if platforms_match:
+        platforms = [p.strip().lower() for p in platforms_match.group(1).split(",") if p.strip()]
+    return name, platforms
+
+
+def config_setting(app: Path, key: str) -> str:
+    match = re.search(
+        rf"^\s+{re.escape(key)}:\s*([^#\n]+)",
+        read(app / CONFIG_NAME),
+        re.M,
+    )
+    return parse_config_name(match.group(1), "") if match else ""
+
+
+def validate_project_identity(app: Path) -> None:
+    """Catch copied/stale release config before a costly store operation."""
+    _, platforms = config_summary(app)
+    unknown = set(platforms) - {"android", "ios"}
+    if not platforms or unknown or len(platforms) != len(set(platforms)):
+        die(f"invalid platforms in {app / CONFIG_NAME}: {', '.join(platforms) or '(none)'}")
+
+    if "android" in platforms:
+        configured = config_setting(app, "package_name")
+        if not real_android_id(configured):
+            die(f"invalid android.package_name in {app / CONFIG_NAME}: {configured or '(missing)'}")
+        detected = detect_android_package(app)
+        if detected and detected != configured:
+            die(
+                f"Android identity mismatch: Gradle applicationId is {detected}, but "
+                f"release_kit.yml says {configured}"
+            )
+
+    if "ios" in platforms:
+        configured_bundle = config_setting(app, "bundle_id")
+        configured_team = config_setting(app, "team_id")
+        if not real_ios_identity(configured_bundle, configured_team):
+            die(f"invalid ios bundle/team identity in {app / CONFIG_NAME}")
+        detected_bundle, detected_team = detect_ios(app)
+        if detected_bundle and detected_bundle != configured_bundle:
+            die(
+                f"iOS identity mismatch: Xcode bundle id is {detected_bundle}, but "
+                f"release_kit.yml says {configured_bundle}"
+            )
+        if detected_team and detected_team != configured_team:
+            die(
+                f"iOS identity mismatch: Xcode team is {detected_team}, but "
+                f"release_kit.yml says {configured_team}"
+            )
+
+
+def ensure_registry_name_available(app: Path, name: str) -> None:
+    app = app.resolve()
+    for project in load_registry()["projects"]:
+        old_path = Path(project.get("path", "")).expanduser()
+        same_path = old_path.resolve() == app
+        moved_same_app = project.get("name") == name and not old_path.exists()
+        if project.get("name") == name and not same_path and not moved_same_app:
+            die(
+                f"another managed project is already named '{name}': {old_path.resolve()}\n"
+                "  Choose one release source. Remove the old registry entry with\n"
+                f"  `frk forget {old_path.resolve()}` before onboarding this path."
+            )
+
+
+def register_project(app: Path) -> None:
+    app = app.resolve()
+    name, platforms = config_summary(app)
+    ensure_registry_name_available(app, name)
+    data = load_registry()
+    projects = []
+    for project in data["projects"]:
+        old_path = Path(project.get("path", "")).expanduser()
+        same_path = old_path.resolve() == app
+        # Re-onboarding a moved project should heal the registry instead of
+        # leaving an unreachable duplicate with the same name.
+        moved_same_app = project.get("name") == name and not old_path.exists()
+        if not same_path and not moved_same_app:
+            projects.append(project)
+    projects.append({
+        "name": name,
+        "path": str(app),
+        "platforms": platforms,
+        "added_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    })
+    data["projects"] = sorted(projects, key=lambda p: (p.get("name", "").lower(), p.get("path", "")))
+    save_registry(data)
+
+
+def managed_projects() -> list[dict]:
+    return load_registry()["projects"]
+
+
+def is_registered(app: Path) -> bool:
+    resolved = app.resolve()
+    return any(
+        Path(project.get("path", "")).expanduser().resolve() == resolved
+        for project in managed_projects()
+    )
+
+
+def resolve_app(value: str | None) -> Path:
+    """Resolve a path or a unique managed-project name; default to cwd."""
+    raw = value or "."
+    path = Path(raw).expanduser()
+    if path.exists():
+        return path.resolve()
+
+    projects = managed_projects()
+    requested_path = path.resolve()
+    path_matches = [
+        p for p in projects
+        if Path(p.get("path", "")).expanduser().resolve() == requested_path
+    ]
+    if len(path_matches) == 1:
+        return requested_path
+
+    matches = [p for p in projects if p.get("name") == raw]
+    if len(matches) == 1:
+        return Path(matches[0]["path"]).expanduser().resolve()
+    if len(matches) > 1:
+        die(f"more than one managed app is named '{raw}'; use its full path")
+    die(f"no path or managed app named '{raw}'")
+
+
+def require_managed_app(value: str | None) -> Path:
+    app = resolve_app(value)
+    if not is_flutter_app(app):
+        die(f"not a Flutter app: {app}")
+    if not is_registered(app):
+        die(f"{app.name} is not registered — run: frk onboard {app}")
+    if not (app / CONFIG_NAME).is_file() or IMPORT_MARKER not in read(app / "fastlane" / "Fastfile"):
+        die(f"{app.name} is not onboarded — run: frk onboard {app}")
+    validate_project_identity(app)
+    return app
+
+
+# --------------------------------------------------------------------------- #
+# project inspection
+# --------------------------------------------------------------------------- #
+def read(path: Path) -> str:
+    try:
+        return path.read_text(errors="replace")
+    except OSError:
+        return ""
+
+
+def detect_android_package(app: Path) -> str | None:
+    """The actual Play identity: applicationId from Gradle.
+
+    Never fall back to `namespace`: Android allows it to differ from the
+    applicationId, and uploading under the wrong package is a costly mistake.
+    Projects that compute applicationId dynamically can pass --android-package.
+    """
+    for name in ("build.gradle.kts", "build.gradle"):
+        text = read(app / "android" / "app" / name)
+        if not text:
+            continue
+        for pattern in (
+            r'applicationId\s*=\s*"([^"]+)"',   # Kotlin DSL
+            r'applicationId\s+"([^"]+)"',       # Groovy
+        ):
+            m = re.search(pattern, text)
+            if m:
+                return m.group(1)
+    return None
+
+
+def detect_ios(app: Path) -> tuple[str | None, str | None]:
+    """(bundle_id, team_id) from the Xcode project, ignoring test targets."""
+    text = read(app / "ios" / "Runner.xcodeproj" / "project.pbxproj")
+    if not text:
+        return None, None
+
+    bundles = [
+        b for b in re.findall(r"PRODUCT_BUNDLE_IDENTIFIER = ([^;]+);", text)
+        if "RunnerTests" not in b
+    ]
+    bundle = bundles[0].strip().strip('"') if bundles else None
+
+    teams = [t.strip().strip('"') for t in re.findall(r"DEVELOPMENT_TEAM = ([^;]+);", text)]
+    teams = [t for t in teams if t and t != '""']
+    return bundle, (teams[0] if teams else None)
+
+
+def detect_firebase_android_app_id(app: Path) -> str | None:
+    text = read(app / "android" / "app" / "google-services.json")
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+        for client in data.get("client", []):
+            app_id = client.get("client_info", {}).get("mobilesdk_app_id")
+            if app_id:
+                return app_id
+    except (ValueError, AttributeError):
+        pass
+    return None
+
+
+def pubspec_version(app: Path) -> str | None:
+    m = re.search(r"^version:\s*(\S+)", read(app / "pubspec.yaml"), re.M)
+    return m.group(1) if m else None
+
+
+def is_flutter_app(app: Path) -> bool:
+    text = read(app / "pubspec.yaml")
+    return bool(text) and "flutter:" in text
+
+
+def inspect(app: Path) -> dict:
+    android_pkg = detect_android_package(app)
+    ios_bundle, ios_team = detect_ios(app)
+    return {
+        "name": app.name,
+        "path": app,
+        "version": pubspec_version(app),
+        "android_package": android_pkg,
+        "android_real": real_android_id(android_pkg),
+        "android_signing": (app / "android" / "key.properties").is_file(),
+        "ios_bundle_id": ios_bundle,
+        "ios_team_id": ios_team,
+        # A scaffolded ios/ directory means nothing — Flutter always creates one.
+        # A configured team AND a non-placeholder bundle id is the real signal.
+        "ios_real": real_ios_identity(ios_bundle, ios_team),
+        "firebase_android_app_id": detect_firebase_android_app_id(app),
+        "onboarded": (
+            (app / CONFIG_NAME).is_file()
+            and IMPORT_MARKER in read(app / "fastlane" / "Fastfile")
+        ),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# onboarding
+# --------------------------------------------------------------------------- #
+def render_config(facts: dict, platforms: list[str], track: str) -> str:
+    """Hand-rolled YAML: keeps this script dependency-free and the output
+    comment-rich, which matters more here than generality."""
+    lines = [
+        "# Flutter Release Kit — per-app configuration.",
+        "#",
+        "# Committed on purpose: these are public identifiers, not secrets.",
+        "# Credentials live in ~/.flutter-release/ and are never stored per app.",
+        "#",
+        "# The shared lanes read this file; see the kit's docs/ONBOARDING.md.",
+        "",
+        f"name: {json.dumps(str(facts['name']), ensure_ascii=False)}",
+        "",
+        "# Which stores this app actually ships to. A scaffolded ios/ directory is",
+        "# not enough — listing ios here means there is a real App Store record.",
+        f"platforms: [{', '.join(platforms)}]",
+        "",
+        "# Dart obfuscation + split debug info for Android release builds.",
+        "obfuscate: true",
+        "",
+    ]
+
+    if "android" in platforms:
+        lines += [
+            "android:",
+            f"  package_name: {facts['android_package']}",
+            "",
+            "  # Testing tracks only: internal | alpha | beta.",
+            "  # `production` is rejected by the kit at upload time.",
+            f"  track: {track}",
+        ]
+        if facts["firebase_android_app_id"]:
+            lines += [
+                "",
+                "  # Enables `UPLOAD_CRASHLYTICS_SYMBOLS=true` to push obfuscation symbols.",
+                f"  firebase_app_id: \"{facts['firebase_android_app_id']}\"",
+            ]
+        lines += [
+            "",
+            "  # Optional: only if this app uses a DIFFERENT Play developer account.",
+            "  # Relative paths resolve inside ~/.flutter-release/.",
+            "  # play_json_key: play/other-account.json",
+            "",
+        ]
+
+    if "ios" in platforms:
+        lines += [
+            "ios:",
+            "  # The iOS bundle id frequently differs from the Android package name.",
+            f"  bundle_id: {facts['ios_bundle_id']}",
+            f"  team_id: {facts['ios_team_id']}",
+            "",
+        ]
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_file(path: Path, content: str, force: bool, dry: bool) -> str:
+    if path.is_file() and not force:
+        if path.read_text() == content:
+            return "unchanged"
+        return "exists (use --force to overwrite)"
+    if dry:
+        return "would write"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+    return "written"
+
+
+def gitignore_key(rule: str) -> tuple[str, bool]:
+    """Identity of a .gitignore rule, so equivalent spellings compare equal.
+
+    Git anchors a pattern to the .gitignore's own directory as soon as it holds
+    a slash anywhere but the end, which makes `/android/key.properties` and
+    `android/key.properties` the same rule written two ways. Comparing the raw
+    strings appends the second one next to the first — exactly the duplication
+    this function's caller exists to avoid.
+    """
+    rule = rule.strip()
+    negated = rule.startswith("!")
+    body = rule[1:] if negated else rule
+    anchored = "/" in body.rstrip("/")
+    return (("!" if negated else "") + body.lstrip("/"), anchored)
+
+
+def append_gitignore(app: Path, dry: bool) -> str:
+    """Append only the rules this repo is actually missing.
+
+    Line-level rather than block-level: a project may already ignore some of
+    this (a keystore rule, a fastlane rule), and pasting the whole block
+    would duplicate those. Duplicated ignore rules are harmless to git but make
+    the file untrustworthy to read, which is how a secret slips through.
+    """
+    snippet = read(TEMPLATES / "gitignore_snippet")
+    marker = "Flutter Release Kit — secrets"
+    gi = app / ".gitignore"
+    existing = read(gi)
+
+    have = {
+        gitignore_key(l) for l in existing.splitlines()
+        if l.strip() and not l.strip().startswith("#")
+    }
+    # Rules only — the snippet's own comments are dropped so the appended block
+    # carries exactly one header rather than repeating whatever is already there.
+    missing = [
+        l for l in snippet.splitlines()
+        if l.strip() and not l.strip().startswith("#") and gitignore_key(l) not in have
+    ]
+
+    if not missing:
+        return "all rules already present"
+    if dry:
+        return f"would add {len(missing)} rule(s)"
+
+    with gi.open("a") as fh:
+        if existing and not existing.endswith("\n"):
+            fh.write("\n")
+        if marker not in existing:
+            fh.write(f"\n# {marker}. NEVER commit anything below.\n")
+        else:
+            fh.write("\n# Additional Flutter Release Kit secret rules.\n")
+        fh.write("\n".join(missing) + "\n")
+    return f"added {len(missing)} rule(s)"
+
+
+def export_options_plist(team_id: str, bundle_id: str) -> str:
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>method</key>
+    <string>app-store-connect</string>
+    <key>teamID</key>
+    <string>{team_id}</string>
+    <!-- `fastlane ios setup_signing` creates this deterministic profile name.
+         Pinning it prevents Xcode from silently selecting a stale automatic
+         profile that belongs to a different distribution certificate. -->
+    <key>signingStyle</key>
+    <string>manual</string>
+    <key>signingCertificate</key>
+    <string>Apple Distribution</string>
+    <key>provisioningProfiles</key>
+    <dict>
+        <key>{bundle_id}</key>
+        <string>{bundle_id} AppStore</string>
+    </dict>
+    <key>uploadSymbols</key>
+    <true/>
+    <!-- `export` writes a local .ipa that Fastlane then uploads. Do NOT set this
+         to `upload`: xcodebuild would push the build itself during export,
+         leaving no .ipa on disk for upload_to_testflight. -->
+    <key>destination</key>
+    <string>export</string>
+    <!-- Keep the version/build numbers Flutter baked in. -->
+    <key>manageAppVersionAndBuildNumber</key>
+    <false/>
+</dict>
+</plist>
+"""
+
+
+def cmd_onboard(args) -> int:
+    app = Path(args.app_dir).expanduser().resolve()
+    if not app.is_dir():
+        die(f"not a directory: {app}")
+    if not is_flutter_app(app):
+        die(f"not a Flutter app (no flutter section in pubspec.yaml): {app}")
+
+    facts = inspect(app)
+    if args.android_package:
+        facts["android_package"] = args.android_package.strip()
+        facts["android_real"] = real_android_id(facts["android_package"])
+    if args.ios_bundle_id:
+        facts["ios_bundle_id"] = args.ios_bundle_id.strip()
+    if args.ios_team_id:
+        facts["ios_team_id"] = args.ios_team_id.strip()
+    if args.ios_bundle_id or args.ios_team_id:
+        facts["ios_real"] = real_ios_identity(facts["ios_bundle_id"], facts["ios_team_id"])
+    # The directory name is only a default. It can be wrong when an app lives in
+    # a generic subdirectory such as `project/v2`, which would otherwise be
+    # onboarded, logged and reported as "v2".
+    if args.name:
+        facts["name"] = args.name.strip()
+    if not facts["name"] or any(ord(ch) < 32 for ch in facts["name"]):
+        die("app name must be non-empty and cannot contain control characters")
+    ensure_registry_name_available(app, facts["name"])
+    head(f"Onboarding {facts['name']}")
+    info(f"path            {app}")
+    info(f"pubspec version {facts['version'] or '-'}")
+    info(f"android package {facts['android_package'] or '-'}")
+    info(f"ios bundle id   {facts['ios_bundle_id'] or '-'}")
+    info(f"ios team        {facts['ios_team_id'] or '-'}")
+
+    # Platform selection: explicit flag wins, otherwise detect.
+    if args.platforms:
+        platforms = list(dict.fromkeys(
+            p.strip().lower() for p in args.platforms.split(",") if p.strip()
+        ))
+        bad = [p for p in platforms if p not in ("android", "ios")]
+        if bad:
+            die(f"unknown platform(s): {', '.join(bad)}")
+    else:
+        platforms = []
+        if facts["android_real"]:
+            platforms.append("android")
+        if facts["ios_real"]:
+            platforms.append("ios")
+
+    if not platforms:
+        die(
+            "could not determine any release-ready platform.\n"
+            "  Android needs a real applicationId; iOS needs DEVELOPMENT_TEAM and a\n"
+            "  non-placeholder bundle id. Configure those identifiers in the app,\n"
+            "  or pass the matching --android-package / --ios-bundle-id / --ios-team-id overrides."
+        )
+
+    if "ios" in platforms and not facts["ios_real"]:
+        die("iOS requested but its bundle id or 10-character DEVELOPMENT_TEAM is missing, invalid, or placeholder")
+    if "android" in platforms and not facts["android_real"]:
+        die("Android requested but its applicationId is missing, invalid, or still com.example.*")
+
+    head("Platforms")
+    if "android" in platforms:
+        ok(f"android — {facts['android_package']}")
+    elif facts["android_package"]:
+        warn(f"android skipped ({facts['android_package']})")
+    if "ios" in platforms:
+        ok(f"ios     — {facts['ios_bundle_id']} (team {facts['ios_team_id']})")
+    else:
+        if facts["ios_real"]:
+            why = "not selected for this app"
+        elif not facts["ios_team_id"]:
+            why = "no DEVELOPMENT_TEAM"
+        else:
+            why = "placeholder bundle id"
+        warn(f"ios skipped — {why}. Add with --platforms android,ios once set up.")
+
+    existing_fastfile = app / "fastlane" / "Fastfile"
+    if existing_fastfile.is_file() and not args.force and IMPORT_MARKER not in read(existing_fastfile):
+        die(f"{existing_fastfile} exists but does not import this kit; inspect it or use --force")
+    existing_config = app / CONFIG_NAME
+    if existing_config.is_file() and not args.force:
+        _, configured = config_summary(app)
+        if not configured:
+            die(f"{existing_config} exists but its platforms could not be read; inspect it or use --force")
+        if set(configured) != set(platforms):
+            die(
+                f"{existing_config} already configures {','.join(configured)}, but onboarding requested "
+                f"{','.join(platforms)}; use matching --platforms or review and rerun with --force"
+            )
+
+    head("Files")
+    results = {}
+
+    fastfile = read(TEMPLATES / "app_Fastfile").replace("{{APP_NAME}}", facts["name"])
+    results["fastlane/Fastfile"] = write_file(app / "fastlane" / "Fastfile", fastfile, args.force, args.dry_run)
+
+    cfg = render_config(facts, platforms, args.track)
+    results[CONFIG_NAME] = write_file(app / CONFIG_NAME, cfg, args.force, args.dry_run)
+
+    if "ios" in platforms:
+        results["ios/ExportOptions.plist"] = write_file(
+            app / "ios" / "ExportOptions.plist",
+            export_options_plist(facts["ios_team_id"], facts["ios_bundle_id"]),
+            args.force, args.dry_run,
+        )
+
+    results[".gitignore"] = append_gitignore(app, args.dry_run)
+
+    for name, status in results.items():
+        successful = status in ("written", "unchanged", "all rules already present") or status.startswith("added ")
+        (ok if successful else warn)(f"{name}: {status}")
+
+    head("Next steps")
+    step = 1
+    if "android" in platforms:
+        if not facts["android_signing"]:
+            fail("android/key.properties is missing — release builds would use the debug key")
+        info(f"{step}. Grant the Play service account access to this app:")
+        info(f"     Play Console > Users and permissions > App permissions > add {facts['android_package']}")
+        info("     Permission: \"Release to testing tracks, excluding production\"")
+        info("     (Play grants are PER APP — other apps working proves nothing.)")
+        step += 1
+    if "ios" in platforms:
+        info(f"{step}. Ensure a distribution certificate exists (account-level, one-time):")
+        info("     fastlane ios setup_signing")
+        step += 1
+    info(f"{step}. Validate everything:")
+    info(f"     cd {app} && frk doctor")
+
+    if args.dry_run:
+        head("Dry run — nothing was written")
+    else:
+        if IMPORT_MARKER not in read(app / "fastlane" / "Fastfile"):
+            die("onboarding did not produce a valid shared Fastfile importer")
+        if not config_summary(app)[1]:
+            die("onboarding did not produce a readable platform configuration")
+        # The registry is the opt-in boundary: merely living below a common
+        # workspace directory never makes an app managed by this tool.
+        register_project(app)
+        ok(f"registered as a managed project in {REGISTRY_PATH}")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# other commands
+# --------------------------------------------------------------------------- #
+def cmd_doctor(args) -> int:
+    return run_fastlane(require_managed_app(args.app_dir), ["doctor"])
+
+
+def fastlane_env() -> dict:
+    return {
+        **os.environ,
+        "LC_ALL": "en_US.UTF-8",
+        "LANG": "en_US.UTF-8",
+        "FASTLANE_SKIP_UPDATE_CHECK": "1",
+        "FLUTTER_RELEASE_KIT": str(KIT_ROOT),
+    }
+
+
+def run_fastlane(
+    app: Path,
+    lane: list[str],
+    options: list[str] | None = None,
+    *,
+    prevent_sleep: bool = False,
+) -> int:
+    if shutil.which("fastlane") is None:
+        die("fastlane is not installed — run `brew install fastlane`")
+    command = ["fastlane", *lane, *(options or [])]
+    if prevent_sleep and sys.platform == "darwin" and shutil.which("caffeinate"):
+        command = ["caffeinate", "-ims", *command]
+    head(f"{app.name}: {' '.join(command)}")
+    sys.stdout.flush()
+    return subprocess.call(command, cwd=app, env=fastlane_env())
+
+
+def lane_options(args, *, release: bool) -> list[str]:
+    result = []
+    if args.build_number:
+        if not re.fullmatch(r"[1-9]\d*", args.build_number) or int(args.build_number) > 2_100_000_000:
+            die("--build-number must be an integer between 1 and 2100000000")
+    invalid_name = args.build_name and (
+        any(ch.isspace() for ch in args.build_name)
+        or any(ord(ch) < 32 for ch in args.build_name)
+    )
+    if invalid_name:
+        die("--build-name cannot contain whitespace or control characters")
+    if release and getattr(args, "skip_build", False) and (args.build_name or args.build_number):
+        die("do not combine --skip-build with version overrides; the existing artifact may have a different version")
+    if args.build_name:
+        result.append(f"build_name:{args.build_name}")
+    if args.build_number:
+        result.append(f"build_number:{args.build_number}")
+    if release and getattr(args, "skip_tests", False):
+        result.append("skip_tests:true")
+    if release and getattr(args, "skip_build", False):
+        result.append("skip_build:true")
+    if release and getattr(args, "dry_run", False):
+        result.append("dry_run:true")
+    return result
+
+
+def require_configured_platform(app: Path, target: str) -> list[str]:
+    _, configured = config_summary(app)
+    if not configured:
+        die(f"could not read platforms from {app / CONFIG_NAME}")
+    if target != "all" and target not in configured:
+        die(f"{app.name} is not configured for {target}; configured: {', '.join(configured)}")
+    return configured
+
+
+def cmd_verify(args) -> int:
+    return run_fastlane(require_managed_app(args.app_dir), ["verify"])
+
+
+def cmd_build(args) -> int:
+    app = require_managed_app(args.app_dir)
+    configured = require_configured_platform(app, args.platform)
+    options = lane_options(args, release=False)
+    targets = configured if args.platform == "all" else [args.platform]
+    for platform in targets:
+        lane = [platform, "build_aab" if platform == "android" else "build_ipa"]
+        code = run_fastlane(app, lane, options)
+        if code:
+            return code
+    return 0
+
+
+def cmd_release(args) -> int:
+    app = require_managed_app(args.app_dir)
+    configured = require_configured_platform(app, args.platform)
+    if args.dry_run and (args.platform == "ios" or (args.platform == "all" and "ios" in configured)):
+        die("--dry-run is available for Google Play validation only, not TestFlight")
+    options = lane_options(args, release=True)
+    lane = ["release"] if args.platform == "all" else [args.platform, "release"]
+    return run_fastlane(app, lane, options, prevent_sleep=True)
+
+
+def cmd_list(args) -> int:
+    projects = managed_projects()
+    print(f"\n{_c('1', 'Managed Flutter apps (opt-in only)')}\n")
+    if not projects:
+        print("No managed projects. Run `frk onboard` inside a project.")
+        return 0
+
+    app_col, platform_col, version_col = 24, 16, 14
+    print(f"{'APP':<{app_col}}{'PLATFORMS':<{platform_col}}{'VERSION':<{version_col}}PATH")
+    print("-" * 96)
+    for entry in projects:
+        app = Path(entry.get("path", "")).expanduser()
+        app_exists = app.is_dir()
+        ready = (
+            app_exists
+            and (app / CONFIG_NAME).is_file()
+            and IMPORT_MARKER in read(app / "fastlane" / "Fastfile")
+        )
+        if ready:
+            name, platforms = config_summary(app)
+            version = pubspec_version(app) or "-"
+            suffix = ""
+        else:
+            name = entry.get("name", app.name or "?")
+            platforms = entry.get("platforms", [])
+            version = "-"
+            suffix = "  [incomplete]" if app_exists else "  [missing]"
+        name = name if len(name) < app_col else name[: app_col - 2] + "…"
+        print(f"{name:<{app_col}}{','.join(platforms):<{platform_col}}{version:<{version_col}}{app}{suffix}")
+
+    print(f"\n{len(projects)} managed project(s). Unlisted folders are never touched.")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# Versioned machine API for native/automation clients
+# --------------------------------------------------------------------------- #
+def api_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def api_emit(event_type: str, **payload) -> None:
+    """Write one stable JSON Lines event. Human output never enters this API."""
+    event = {
+        "protocolVersion": API_PROTOCOL_VERSION,
+        "cliVersion": VERSION,
+        "type": event_type,
+        "timestamp": api_timestamp(),
+        **payload,
+    }
+    print(json.dumps(event, ensure_ascii=False, separators=(",", ":")), flush=True)
+
+
+def api_document(**payload) -> dict:
+    return {
+        "protocolVersion": API_PROTOCOL_VERSION,
+        "cliVersion": VERSION,
+        **payload,
+    }
+
+
+def split_pubspec_version(value: str | None) -> tuple[str | None, int | None]:
+    if not value:
+        return None, None
+    name, separator, number = value.partition("+")
+    return name or None, (int(number) if separator and number.isdigit() else None)
+
+
+def artifact_record(path: Path | None) -> dict | None:
+    if not path or not path.is_file():
+        return None
+    stat = path.stat()
+    return {
+        "path": str(path.resolve()),
+        "sizeBytes": stat.st_size,
+        "modifiedAt": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(timespec="seconds"),
+    }
+
+
+def newest_path(paths) -> Path | None:
+    files = [path for path in paths if path.is_file()]
+    return max(files, key=lambda path: path.stat().st_mtime) if files else None
+
+
+def env_values(path: Path) -> dict[str, str]:
+    values = {}
+    for line in read(path).splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip('"\'')
+    return values
+
+
+def ensure_credential_vault() -> Path:
+    """Create only the private shared-credential structure, idempotently."""
+    for directory in (CREDENTIALS_DIR, CREDENTIALS_DIR / "asc", CREDENTIALS_DIR / "play"):
+        ensure_private_dir(directory)
+    env_file = CREDENTIALS_DIR / "credentials.env"
+    if env_file.exists() and not env_file.is_file():
+        raise ValueError(f"credentials path is not a file: {env_file}")
+    if not env_file.exists():
+        env_file.write_text(CREDENTIALS_ENV_TEMPLATE)
+    env_file.chmod(0o600)
+    return env_file
+
+
+def update_env_values(path: Path, updates: dict[str, str]) -> None:
+    """Update active keys atomically while preserving comments and unknown values."""
+    lines = read(path).splitlines()
+    written = set()
+    output = []
+    for line in lines:
+        match = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=", line)
+        key = match.group(1) if match else None
+        if key not in updates:
+            output.append(line)
+            continue
+        if key not in written:
+            output.append(f"{key}={updates[key]}")
+            written.add(key)
+    if output and output[-1] != "":
+        output.append("")
+    for key, value in updates.items():
+        if key not in written:
+            output.append(f"{key}={value}")
+    temp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    temp.write_text("\n".join(output).rstrip() + "\n")
+    temp.chmod(0o600)
+    os.replace(temp, path)
+
+
+def resolve_shared_credential_path(value: str) -> Path | None:
+    if not value:
+        return None
+    raw = Path(os.path.expandvars(os.path.expanduser(value)))
+    candidate = raw if raw.is_absolute() else CREDENTIALS_DIR / raw
+    return candidate.resolve() if candidate.is_file() else None
+
+
+def _private_copy(source: Path, target: Path, *, force: bool) -> None:
+    if target.exists():
+        if not target.is_file():
+            raise ValueError(f"credential destination is not a file: {target}")
+        if source.read_bytes() == target.read_bytes():
+            target.chmod(0o600)
+            return
+        if not force:
+            raise ValueError(
+                f"a different credential already exists at {target}; retry with --force to replace it"
+            )
+    descriptor, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+    os.close(descriptor)
+    temp = Path(temp_name)
+    try:
+        shutil.copyfile(source, temp)
+        temp.chmod(0o600)
+        os.replace(temp, target)
+    finally:
+        if temp.exists():
+            temp.unlink()
+
+
+def _play_key_details(path: Path | None) -> tuple[bool, str, str | None, str | None]:
+    if not path:
+        return False, "Service-account JSON is not configured", None, None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return False, f"Service-account JSON is unreadable: {exc}", None, None
+    required = ("type", "project_id", "private_key_id", "private_key", "client_email")
+    missing = [key for key in required if not isinstance(data.get(key), str) or not data[key].strip()]
+    if data.get("type") != "service_account":
+        return False, "Selected JSON is not a Google service-account key", None, None
+    if missing:
+        return False, f"Service-account JSON is missing: {', '.join(missing)}", None, None
+    if "BEGIN PRIVATE KEY" not in data["private_key"]:
+        return False, "Service-account private key is malformed", None, None
+    return True, "Service-account key is valid", data["client_email"], data["project_id"]
+
+
+def _asc_key_details(path: Path | None) -> tuple[bool, str]:
+    if not path:
+        return False, "App Store Connect .p8 key is not configured"
+    try:
+        content = path.read_text().strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        return False, f"App Store Connect key is unreadable: {exc}"
+    if "-----BEGIN PRIVATE KEY-----" not in content or "-----END PRIVATE KEY-----" not in content:
+        return False, "Selected file is not a valid App Store Connect .p8 private key"
+    return True, "App Store Connect API key is valid"
+
+
+def credential_status_record() -> dict:
+    shared = env_values(CREDENTIALS_DIR / "credentials.env")
+
+    play_value = os.environ.get("SUPPLY_JSON_KEY", "").strip() or shared.get("SUPPLY_JSON_KEY", "").strip()
+    play_path = resolve_shared_credential_path(play_value)
+    play_valid, play_detail, client_email, project_id = _play_key_details(play_path)
+
+    key_id = os.environ.get("ASC_KEY_ID", "").strip() or shared.get("ASC_KEY_ID", "").strip()
+    issuer_id = os.environ.get("ASC_ISSUER_ID", "").strip() or shared.get("ASC_ISSUER_ID", "").strip()
+    key_content = os.environ.get("ASC_KEY_CONTENT", "").strip() or shared.get("ASC_KEY_CONTENT", "").strip()
+    key_value = os.environ.get("ASC_KEY_FILEPATH", "").strip() or shared.get("ASC_KEY_FILEPATH", "").strip()
+    key_path = resolve_shared_credential_path(key_value)
+    if key_content:
+        key_valid = "BEGIN PRIVATE KEY" in key_content and "END PRIVATE KEY" in key_content
+        key_detail = "App Store Connect API key content is valid" if key_valid else "ASC_KEY_CONTENT is malformed"
+    else:
+        key_valid, key_detail = _asc_key_details(key_path)
+    identifiers_valid = bool(
+        ASC_KEY_ID_PATTERN.fullmatch(key_id) and ASC_ISSUER_ID_PATTERN.fullmatch(issuer_id)
+    )
+    asc_valid = bool(key_valid and identifiers_valid)
+    if key_valid and not ASC_KEY_ID_PATTERN.fullmatch(key_id):
+        key_detail = "App Store Connect Key ID must contain 10 uppercase letters or digits"
+    elif key_valid and not ASC_ISSUER_ID_PATTERN.fullmatch(issuer_id):
+        key_detail = "App Store Connect Issuer ID must be a UUID"
+
+    return {
+        "vaultPath": str(CREDENTIALS_DIR.resolve()),
+        "configuredAny": bool(play_valid or asc_valid),
+        "googlePlay": {
+            "configured": play_valid,
+            "validationStatus": "ready" if play_valid else ("invalid" if play_value else "missing"),
+            "detail": play_detail,
+            "keyPath": str(play_path) if play_path else None,
+            "clientEmail": client_email,
+            "projectId": project_id,
+        },
+        "appStoreConnect": {
+            "configured": asc_valid,
+            "validationStatus": "ready" if asc_valid else ("invalid" if key_id or issuer_id or key_value or key_content else "missing"),
+            "detail": key_detail,
+            "keyPath": str(key_path) if key_path else None,
+            "keyId": key_id or None,
+            "issuerId": issuer_id or None,
+        },
+    }
+
+
+def configure_play_credentials(source_value: str, *, force: bool) -> dict:
+    source = Path(source_value).expanduser().resolve()
+    if not source.is_file():
+        raise ValueError(f"Google Play service-account file was not found: {source}")
+    valid, detail, _, _ = _play_key_details(source)
+    if not valid:
+        raise ValueError(detail)
+    env_file = ensure_credential_vault()
+    target = CREDENTIALS_DIR / "play" / "service-account.json"
+    _private_copy(source, target, force=force)
+    update_env_values(env_file, {"SUPPLY_JSON_KEY": "play/service-account.json"})
+    return credential_status_record()
+
+
+def configure_asc_credentials(source_value: str, key_id: str | None, issuer_id: str | None, *, force: bool) -> dict:
+    key_id = (key_id or "").strip().upper()
+    issuer_id = (issuer_id or "").strip()
+    if not ASC_KEY_ID_PATTERN.fullmatch(key_id):
+        raise ValueError("App Store Connect Key ID must contain 10 uppercase letters or digits")
+    if not ASC_ISSUER_ID_PATTERN.fullmatch(issuer_id):
+        raise ValueError("App Store Connect Issuer ID must be a UUID")
+    source = Path(source_value).expanduser().resolve()
+    if not source.is_file():
+        raise ValueError(f"App Store Connect key was not found: {source}")
+    valid, detail = _asc_key_details(source)
+    if not valid:
+        raise ValueError(detail)
+    env_file = ensure_credential_vault()
+    target = CREDENTIALS_DIR / "asc" / f"AuthKey_{key_id}.p8"
+    _private_copy(source, target, force=force)
+    update_env_values(env_file, {
+        "ASC_KEY_ID": key_id,
+        "ASC_ISSUER_ID": issuer_id,
+        "ASC_KEY_FILEPATH": f"asc/{target.name}",
+    })
+    return credential_status_record()
+
+
+def setup_credential(app: Path, key: str) -> str:
+    """Mirror Fastlane's environment > app .env > shared credential precedence."""
+    if os.environ.get(key, "").strip():
+        return os.environ[key].strip()
+    app_value = env_values(app / "fastlane" / ".env").get(key, "").strip()
+    if app_value:
+        return app_value
+    return env_values(CREDENTIALS_DIR / "credentials.env").get(key, "").strip()
+
+
+def resolve_setup_credential_path(app: Path, value: str) -> Path | None:
+    if not value:
+        return None
+    raw = Path(os.path.expandvars(os.path.expanduser(value)))
+    candidates = [raw] if raw.is_absolute() else [app / raw, CREDENTIALS_DIR / raw]
+    return next((path.resolve() for path in candidates if path.is_file()), None)
+
+
+def asc_credentials_ready(app: Path) -> bool:
+    key_id = setup_credential(app, "ASC_KEY_ID")
+    issuer_id = setup_credential(app, "ASC_ISSUER_ID")
+    content = setup_credential(app, "ASC_KEY_CONTENT")
+    filepath = setup_credential(app, "ASC_KEY_FILEPATH")
+    resolved = resolve_setup_credential_path(app, filepath)
+
+    if not content and not resolved:
+        candidates = list((CREDENTIALS_DIR / "asc").glob("AuthKey_*.p8"))
+        candidates += list((app / "key").glob("AuthKey_*.p8"))
+        if key_id:
+            candidates = [path for path in candidates if path.name == f"AuthKey_{key_id}.p8"]
+        if len(candidates) == 1:
+            resolved = candidates[0]
+            if not key_id:
+                key_id = resolved.stem.removeprefix("AuthKey_")
+    return bool(key_id and issuer_id and (content or resolved))
+
+
+def android_gradle_signing_record(app: Path) -> dict:
+    """Conservatively confirm that release builds consume key.properties."""
+    candidates = [
+        app / "android" / "app" / "build.gradle.kts",
+        app / "android" / "app" / "build.gradle",
+    ]
+    build_file = next((path for path in candidates if path.is_file()), None)
+    if not build_file:
+        return {
+            "ready": False,
+            "path": None,
+            "detail": "android/app/build.gradle(.kts) was not found",
+        }
+
+    text = read(build_file)
+    reads_properties = "key.properties" in text
+    has_signing_block = "signingConfigs" in text
+    has_values = all(key in text for key in ANDROID_SIGNING_KEYS)
+    release_uses_signing = bool(re.search(
+        r"signingConfig\s*(?:=|\s+).{0,300}?signingConfigs.{0,120}?(?:release|getByName\(\s*[\"']release[\"']\s*\))",
+        text,
+        re.S,
+    ))
+    ready = reads_properties and has_signing_block and has_values and release_uses_signing
+    if ready:
+        detail = "Release builds load android/key.properties"
+    else:
+        missing = []
+        if not reads_properties:
+            missing.append("key.properties is not loaded")
+        if not has_signing_block or not has_values:
+            missing.append("release signing values are incomplete")
+        if not release_uses_signing:
+            missing.append("the release build type does not select the signing config")
+        detail = "; ".join(missing)
+    return {"ready": ready, "path": str(build_file), "detail": detail}
+
+
+def decode_provisioning_profile(path: Path) -> tuple[dict | None, str | None]:
+    security = shutil.which("security")
+    if not security:
+        return None, "macOS security tool is unavailable"
+    result = subprocess.run(
+        [security, "cms", "-D", "-i", str(path)],
+        capture_output=True,
+    )
+    if result.returncode:
+        detail = result.stderr.decode(errors="replace").strip().splitlines()
+        return None, detail[-1] if detail else "the profile could not be decoded"
+    try:
+        payload = plistlib.loads(result.stdout)
+    except (plistlib.InvalidFileException, ValueError) as exc:
+        return None, f"invalid provisioning profile: {exc}"
+    return payload if isinstance(payload, dict) else None, None
+
+
+def provisioning_profile_record(
+    path: Path,
+    bundle: str,
+    team: str,
+    local_identity_fingerprints: list[str],
+) -> dict:
+    if not path.is_file():
+        return {
+            "status": "missing",
+            "ready": False,
+            "detail": "The app-specific App Store provisioning profile is missing",
+            "expiresAt": None,
+            "name": None,
+            "certificateMatchesIdentity": False,
+        }
+
+    profile, error = decode_provisioning_profile(path)
+    if not profile:
+        return {
+            "status": "invalid",
+            "ready": False,
+            "detail": error or "The provisioning profile is unreadable",
+            "expiresAt": None,
+            "name": None,
+            "certificateMatchesIdentity": False,
+        }
+
+    entitlements = profile.get("Entitlements") or {}
+    profile_team = (
+        entitlements.get("com.apple.developer.team-identifier")
+        or next(iter(profile.get("TeamIdentifier") or []), None)
+    )
+    app_identifier = str(entitlements.get("application-identifier") or "")
+    expires = profile.get("ExpirationDate")
+    if isinstance(expires, datetime):
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        expires_at = expires.astimezone(timezone.utc).isoformat(timespec="seconds")
+    else:
+        expires_at = None
+
+    certificate_hashes = {
+        hashlib.sha1(bytes(certificate)).hexdigest().upper()
+        for certificate in (profile.get("DeveloperCertificates") or [])
+        if isinstance(certificate, (bytes, bytearray))
+    }
+    local_hashes = {value.upper() for value in local_identity_fingerprints}
+    certificate_match = bool(certificate_hashes & local_hashes)
+
+    if isinstance(expires, datetime) and expires <= datetime.now(timezone.utc):
+        status, detail = "expired", f"Profile expired on {expires_at}"
+    elif profile_team != team:
+        status, detail = "identityMismatch", f"Profile belongs to team {profile_team or '(unknown)'}, not {team}"
+    elif not app_identifier.endswith(f".{bundle}"):
+        status, detail = "identityMismatch", f"Profile does not belong to bundle {bundle}"
+    else:
+        status = "valid"
+        detail = f"{profile.get('Name') or 'App Store profile'} · expires {expires_at or 'at an unknown date'}"
+
+    return {
+        "status": status,
+        "ready": status == "valid",
+        "detail": detail,
+        "expiresAt": expires_at,
+        "name": profile.get("Name"),
+        "certificateMatchesIdentity": certificate_match,
+    }
+
+
+def ios_export_options_record(app: Path, bundle: str, team: str) -> dict:
+    path = app / "ios" / "ExportOptions.plist"
+    if not path.is_file():
+        return {
+            "ready": False,
+            "path": str(path),
+            "detail": "ios/ExportOptions.plist is missing",
+        }
+    try:
+        values = plistlib.loads(path.read_bytes())
+    except (OSError, plistlib.InvalidFileException, ValueError) as exc:
+        return {"ready": False, "path": str(path), "detail": f"Export options are invalid: {exc}"}
+
+    profile_name = (values.get("provisioningProfiles") or {}).get(bundle)
+    problems = []
+    if values.get("method") not in {"app-store", "app-store-connect"}:
+        problems.append("method is not app-store-connect")
+    if values.get("teamID") != team:
+        problems.append("teamID does not match the project")
+    if values.get("signingStyle") != "manual":
+        problems.append("signingStyle is not manual")
+    if profile_name != f"{bundle} AppStore":
+        problems.append("the provisioning profile mapping does not match the app")
+    if values.get("destination") != "export":
+        problems.append("destination is not export")
+    return {
+        "ready": not problems,
+        "path": str(path),
+        "detail": "; ".join(problems) if problems else "Export settings match this app, team, and profile",
+    }
+
+
+_distribution_identities_cache: list[dict[str, str]] | None = None
+
+
+def distribution_identities() -> list[dict[str, str]]:
+    """Return usable local distribution identities without certificate data."""
+    global _distribution_identities_cache
+    if _distribution_identities_cache is not None:
+        return _distribution_identities_cache
+    security = shutil.which("security")
+    if not security:
+        _distribution_identities_cache = []
+        return []
+    result = subprocess.run(
+        [security, "find-identity", "-v", "-p", "codesigning"],
+        capture_output=True,
+        text=True,
+    )
+    identities = []
+    for fingerprint, name in re.findall(r'^\s*\d+\)\s+([A-Fa-f0-9]{40})\s+"([^"]+)"', result.stdout, re.M):
+        if re.search(r"Apple Distribution|iPhone Distribution", name):
+            identities.append({"fingerprint": fingerprint.upper(), "name": name})
+    _distribution_identities_cache = identities
+    return identities
+
+
+def distribution_identity_record(team: str) -> dict:
+    identities = distribution_identities()
+    matching = [identity for identity in identities if team in identity["name"]]
+    # Older iPhone Distribution identities do not always expose the team id in
+    # their display name. A single unambiguous identity is still usable; the
+    # provisioning-profile certificate match below is the definitive check.
+    usable = matching or (identities if len(identities) == 1 else [])
+    if matching:
+        detail = f"Certificate and private key for team {team} are available in Keychain"
+    elif usable:
+        detail = "One distribution identity is available; the profile check confirms whether it belongs to this app"
+    elif identities:
+        detail = f"Distribution identities exist, but none can be associated with team {team}"
+    else:
+        detail = "No Apple Distribution certificate with its private key is available in Keychain"
+    return {
+        "ready": bool(usable),
+        "detail": detail,
+        "fingerprints": [identity["fingerprint"] for identity in usable],
+    }
+
+
+def distribution_identity_ready() -> bool:
+    """Compatibility helper for status screens that are not team-specific."""
+    return bool(distribution_identities())
+
+
+def android_setup_record(app: Path, package: str) -> dict:
+    project_props = app / "android" / "key.properties"
+    props = read_properties(project_props) if project_props.is_file() else {}
+    missing_fields = [key for key in ANDROID_SIGNING_KEYS if not props.get(key)]
+    properties_complete = not missing_fields
+    project_store = resolve_store_file(project_props, props, app) if props.get("storeFile") else None
+    keystore_exists = bool(project_store and project_store.is_file())
+    validation = (
+        probe_keystore_file(project_store, props)
+        if properties_complete and project_store and project_store.is_file()
+        else {
+            "status": "notChecked",
+            "detail": "Keystore validation starts after the properties and file are available",
+            "fingerprint": None,
+        }
+    )
+    gradle = android_gradle_signing_record(app)
+    properties_tracked = git_tracks(app, "android/key.properties")
+    keystore_tracked = bool(project_store and git_tracks_path(project_store))
+    properties_ignored = git_ignores(app, "android/key.properties")
+    keystore_ignored = bool(
+        not project_store or git_path_is_ignored_or_external(project_store)
+    )
+    git_safe = (
+        not properties_tracked
+        and not keystore_tracked
+        and properties_ignored
+        and keystore_ignored
+    )
+
+    vault = SIGNING_DIR / package
+    vault_props = vault / "key.properties"
+    vault_values = read_properties(vault_props) if vault_props.is_file() else {}
+    vault_complete = all(vault_values.get(key) for key in ANDROID_SIGNING_KEYS)
+    vault_store = resolve_store_file(vault_props, vault_values) if vault_complete else None
+    linked = bool(
+        project_props.is_symlink()
+        and vault_props.is_file()
+        and project_props.resolve() == vault_props.resolve()
+    )
+    return {
+        "configured": True,
+        "packageId": package,
+        "projectPropertiesPath": str(project_props),
+        "projectPropertiesExists": project_props.is_file(),
+        "propertiesComplete": properties_complete,
+        "missingPropertiesFields": missing_fields,
+        "referencedKeystorePath": str(project_store) if project_store else None,
+        "keystoreExists": keystore_exists,
+        "keystoreValidationStatus": validation["status"],
+        "keystoreValidationDetail": validation["detail"],
+        "certificateSHA256": validation["fingerprint"],
+        "gradleConfigured": gradle["ready"],
+        "gradleConfigurationPath": gradle["path"],
+        "gradleConfigurationDetail": gradle["detail"],
+        "vaultPath": str(vault),
+        "vaultReady": bool(vault_props.is_file() and vault_store and vault_store.is_file()),
+        "projectLinked": linked,
+        "gitTracked": properties_tracked,
+        "propertiesGitIgnored": properties_ignored,
+        "keystoreGitTracked": keystore_tracked,
+        "keystoreGitIgnored": keystore_ignored,
+        "gitSafe": git_safe,
+        "signingReady": bool(
+            properties_complete
+            and keystore_exists
+            and validation["status"] == "valid"
+            and gradle["ready"]
+            and git_safe
+        ),
+    }
+
+
+def ios_setup_record(app: Path, bundle: str, team: str) -> dict:
+    profile = SIGNING_DIR / "ios" / team / f"AppStore_{bundle}.mobileprovision"
+    workspace = app / "ios" / "Runner.xcworkspace"
+    detected_bundle, detected_team = detect_ios(app)
+    project_identity_ready = detected_bundle == bundle and detected_team == team
+    if project_identity_ready:
+        project_identity_detail = f"Bundle {bundle} uses Apple team {team}"
+    else:
+        project_identity_detail = (
+            f"Xcode has bundle {detected_bundle or '(missing)'} and team {detected_team or '(missing)'}; "
+            f"Release Kit expects {bundle} and {team}"
+        )
+    identity = distribution_identity_record(team)
+    all_fingerprints = [item["fingerprint"] for item in distribution_identities()]
+    profile_record = provisioning_profile_record(profile, bundle, team, all_fingerprints)
+    identity_ready = identity["ready"] or (
+        profile_record["ready"] and profile_record["certificateMatchesIdentity"]
+    )
+    identity_detail = identity["detail"]
+    if not identity["ready"] and identity_ready:
+        identity_detail = "A local distribution identity matches this app's provisioning profile"
+    export_options = ios_export_options_record(app, bundle, team)
+    profile_ready = profile_record["ready"]
+    return {
+        "configured": True,
+        "bundleId": bundle,
+        "teamId": team,
+        "projectIdentityReady": project_identity_ready,
+        "projectIdentityDetail": project_identity_detail,
+        "workspacePath": str(workspace),
+        "workspaceExists": workspace.is_dir(),
+        "distributionIdentityReady": identity_ready,
+        "distributionIdentityDetail": identity_detail,
+        "ascCredentialsReady": asc_credentials_ready(app),
+        "profilePath": str(profile),
+        "profileReady": profile_ready,
+        "profileValidationStatus": profile_record["status"],
+        "profileValidationDetail": profile_record["detail"],
+        "profileExpiresAt": profile_record["expiresAt"],
+        "profileCertificateMatchesIdentity": profile_record["certificateMatchesIdentity"],
+        "exportOptionsReady": export_options["ready"],
+        "exportOptionsPath": export_options["path"],
+        "exportOptionsDetail": export_options["detail"],
+        "signingReady": bool(
+            project_identity_ready
+            and workspace.is_dir()
+            and identity_ready
+            and profile_ready
+            and profile_record["certificateMatchesIdentity"]
+            and export_options["ready"]
+        ),
+    }
+
+
+def setup_status_record(entry: dict) -> dict:
+    app = Path(entry.get("path", "")).expanduser().resolve()
+    _, platforms = config_summary(app)
+    android = None
+    ios = None
+    if "android" in platforms:
+        package = config_setting(app, "package_name") or detect_android_package(app)
+        android = android_setup_record(app, package) if package else None
+    if "ios" in platforms:
+        bundle = config_setting(app, "bundle_id")
+        team = config_setting(app, "team_id")
+        ios = ios_setup_record(app, bundle, team) if bundle and team else None
+    return {"projectId": entry.get("name") or app.name, "android": android, "ios": ios}
+
+
+def project_api_record(entry: dict) -> dict:
+    app = Path(entry.get("path", "")).expanduser()
+    exists = app.is_dir()
+    configured = exists and (app / CONFIG_NAME).is_file()
+    imported = exists and IMPORT_MARKER in read(app / "fastlane" / "Fastfile")
+    onboarded = bool(configured and imported)
+    name = entry.get("name") or app.name or "Unknown"
+    platforms = list(entry.get("platforms") or [])
+    version = None
+    android = None
+    ios = None
+    artifacts = {"androidAab": None, "iosIpa": None}
+
+    if exists:
+        if configured:
+            configured_name, configured_platforms = config_summary(app)
+            name = configured_name
+            platforms = configured_platforms
+        version = pubspec_version(app)
+
+        if "android" in platforms:
+            package = config_setting(app, "package_name") or detect_android_package(app)
+            setup = android_setup_record(app, package) if package else None
+            android = {
+                "packageId": package,
+                "signingReady": bool(setup and setup["signingReady"]),
+                "track": config_setting(app, "track") or "internal",
+            }
+            artifacts["androidAab"] = artifact_record(
+                app / "build" / "app" / "outputs" / "bundle" / "release" / "app-release.aab"
+            )
+
+        if "ios" in platforms:
+            bundle = config_setting(app, "bundle_id")
+            team = config_setting(app, "team_id")
+            setup = ios_setup_record(app, bundle, team) if bundle and team else None
+            ios = {
+                "bundleId": bundle or None,
+                "teamId": team or None,
+                "profileReady": bool(setup and setup["profileReady"]),
+                "profilePath": setup["profilePath"] if setup and setup["profileReady"] else None,
+                "distributionIdentityReady": bool(setup and setup["distributionIdentityReady"]),
+                "signingReady": bool(setup and setup["signingReady"]),
+            }
+            artifacts["iosIpa"] = artifact_record(newest_path((app / "build" / "ios" / "ipa").glob("*.ipa")))
+
+    build_name, build_number = split_pubspec_version(version)
+    if not exists:
+        state = "missing"
+    elif onboarded:
+        state = "ready"
+    else:
+        state = "incomplete"
+
+    return {
+        "id": name,
+        "name": name,
+        "path": str(app.resolve()),
+        "exists": exists,
+        "onboarded": onboarded,
+        "state": state,
+        "platforms": platforms,
+        "version": version,
+        "buildName": build_name,
+        "buildNumber": build_number,
+        "android": android,
+        "ios": ios,
+        "artifacts": artifacts,
+        "addedAt": entry.get("added_at"),
+    }
+
+
+def api_find_project(value: str) -> dict | None:
+    requested = Path(value).expanduser()
+    requested_path = requested.resolve() if requested.exists() else None
+    for entry in managed_projects():
+        entry_path = Path(entry.get("path", "")).expanduser().resolve()
+        if entry.get("name") == value or (requested_path and entry_path == requested_path):
+            return entry
+    return None
+
+
+def cmd_api_capabilities(args) -> int:
+    print(json.dumps(api_document(
+        minimumDesktopProtocol=1,
+        maximumDesktopProtocol=API_PROTOCOL_VERSION,
+        capabilities={
+            "projectDiscovery": True,
+            "streamingEvents": True,
+            "credentialManagement": True,
+            "productionRelease": False,
+            "platforms": ["android", "ios"],
+            "actions": [
+                "onboard", "doctor", "verify", "build", "validate",
+                "release", "signing-audit", "signing-import", "signing-link",
+                "ios-setup-signing", "status", "forget", "credentials", "configure-credentials",
+            ],
+        },
+    ), ensure_ascii=False, separators=(",", ":")))
+    return 0
+
+
+def cmd_api_projects(args) -> int:
+    records = [project_api_record(entry) for entry in managed_projects()]
+    print(json.dumps(api_document(projects=records), ensure_ascii=False, separators=(",", ":")))
+    return 0
+
+
+def cmd_api_project(args) -> int:
+    entry = api_find_project(args.app_dir)
+    if not entry:
+        print(json.dumps(api_document(error={
+            "code": "project_not_found",
+            "message": f"No managed project named or located at {args.app_dir}",
+        }), ensure_ascii=False, separators=(",", ":")))
+        return 1
+    print(json.dumps(api_document(project=project_api_record(entry)),
+                     ensure_ascii=False, separators=(",", ":")))
+    return 0
+
+
+def cmd_api_setup(args) -> int:
+    entry = api_find_project(args.app_dir)
+    if not entry:
+        print(json.dumps(api_document(error={
+            "code": "project_not_found",
+            "message": f"No managed project named or located at {args.app_dir}",
+        }), ensure_ascii=False, separators=(",", ":")))
+        return 1
+    print(json.dumps(api_document(**setup_status_record(entry)),
+                     ensure_ascii=False, separators=(",", ":")))
+    return 0
+
+
+def cmd_api_credentials(args) -> int:
+    print(json.dumps(api_document(**credential_status_record()),
+                     ensure_ascii=False, separators=(",", ":")))
+    return 0
+
+
+def cmd_api_configure_credentials(args) -> int:
+    try:
+        if args.store == "google-play":
+            status = configure_play_credentials(args.file, force=args.force)
+        else:
+            status = configure_asc_credentials(
+                args.file,
+                args.key_id,
+                args.issuer_id,
+                force=args.force,
+            )
+    except ValueError as exc:
+        print(json.dumps(api_document(error={
+            "code": "invalid_credentials",
+            "message": str(exc),
+        }), ensure_ascii=False, separators=(",", ":")))
+        return 1
+    print(json.dumps(api_document(**status), ensure_ascii=False, separators=(",", ":")))
+    return 0
+
+
+def require_api_value(value: str | None, label: str) -> str:
+    if not value:
+        raise ValueError(f"{label} is required for this action")
+    return value
+
+
+def api_action_command(args) -> list[str]:
+    """Map the stable protocol to the current human CLI. Keep this map backwards compatible."""
+    frk = [sys.executable, str(Path(__file__).resolve())]
+    action = args.action
+    app = args.app_dir
+
+    if action == "status":
+        return [*frk, "status"]
+    if action == "forget":
+        return [*frk, "forget", require_api_value(app, "project")]
+    if action in ("doctor", "verify"):
+        return [*frk, action, require_api_value(app, "project")]
+    if action in ("signing-audit", "signing-link"):
+        signing_action = action.removeprefix("signing-")
+        return [*frk, "signing", signing_action, require_api_value(app, "project")]
+    if action == "signing-import":
+        command = [*frk, "signing", "import", require_api_value(app, "project")]
+        if args.properties:
+            command += ["--properties", args.properties]
+        if args.keystore:
+            command += ["--keystore", args.keystore]
+        if args.force:
+            command.append("--force")
+        if args.link:
+            command.append("--link")
+        return command
+    if action == "ios-setup-signing":
+        return [*frk, "signing", "ios-setup", require_api_value(app, "project")]
+    if action == "onboard":
+        command = [*frk, "onboard", require_api_value(app, "project path")]
+        for flag, value in (
+            ("--name", args.name),
+            ("--platforms", args.platforms),
+            ("--android-package", args.android_package),
+            ("--ios-bundle-id", args.ios_bundle_id),
+            ("--ios-team-id", args.ios_team_id),
+            ("--track", args.track),
+        ):
+            if value:
+                command += [flag, value]
+        if args.dry_run:
+            command.append("--dry-run")
+        return command
+    if action in ("build", "validate", "release"):
+        platform = require_api_value(args.platform, "platform")
+        if action == "validate" and platform != "android":
+            raise ValueError("validate is available for Android only; TestFlight has no dry-run upload")
+        command_name = "release" if action in ("validate", "release") else "build"
+        command = [*frk, command_name, platform, require_api_value(app, "project")]
+        if args.build_name:
+            command += ["--build-name", args.build_name]
+        if args.build_number:
+            command += ["--build-number", args.build_number]
+        if action == "validate":
+            command.append("--dry-run")
+        if action == "release":
+            if args.skip_tests:
+                command.append("--skip-tests")
+            if args.skip_build:
+                command.append("--skip-build")
+        return command
+    raise ValueError(f"unsupported API action: {action}")
+
+
+def cmd_api_run(args) -> int:
+    started = time.monotonic()
+    try:
+        command = api_action_command(args)
+    except ValueError as exc:
+        api_emit("error", action=args.action, code="invalid_request", message=str(exc))
+        api_emit("finished", action=args.action, success=False, exitCode=2, durationSeconds=0.0)
+        return 2
+
+    api_emit(
+        "started",
+        action=args.action,
+        project=args.app_dir,
+        platform=args.platform,
+    )
+    environment = os.environ.copy()
+    environment["FASTLANE_DISABLE_COLORS"] = "1"
+    environment["TERM"] = "dumb"
+    process = subprocess.Popen(
+        command,
+        cwd=KIT_ROOT,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        start_new_session=True,
+    )
+
+    def terminate_group(signum, frame):
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+    previous_term = signal.signal(signal.SIGTERM, terminate_group)
+    previous_int = signal.signal(signal.SIGINT, terminate_group)
+    sequence = 0
+    try:
+        assert process.stdout is not None
+        for raw in process.stdout:
+            message = ANSI_ESCAPE.sub("", raw.rstrip("\r\n"))
+            if not message:
+                continue
+            sequence += 1
+            api_emit("log", action=args.action, sequence=sequence, stream="combined", message=message)
+        code = process.wait()
+    finally:
+        signal.signal(signal.SIGTERM, previous_term)
+        signal.signal(signal.SIGINT, previous_int)
+
+    if code < 0:
+        code = 128 + abs(code)
+    api_emit(
+        "finished",
+        action=args.action,
+        success=code == 0,
+        exitCode=code,
+        durationSeconds=round(time.monotonic() - started, 3),
+    )
+    return code
+
+
+def cmd_forget(args) -> int:
+    app = resolve_app(args.app_dir)
+    data = load_registry()
+    before = len(data["projects"])
+    data["projects"] = [
+        p for p in data["projects"]
+        if Path(p.get("path", "")).expanduser().resolve() != app
+    ]
+    if len(data["projects"]) == before:
+        die(f"{app} is not in the managed-project registry")
+    save_registry(data)
+    ok(f"forgot {app}; no project files were changed")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# Android upload-key vault
+# --------------------------------------------------------------------------- #
+def _unescape_java_property(value: str) -> str:
+    """Decode the escapes understood by java.util.Properties.load."""
+    output = []
+    index = 0
+    escapes = {"t": "\t", "n": "\n", "r": "\r", "f": "\f"}
+    while index < len(value):
+        if value[index] != "\\":
+            output.append(value[index])
+            index += 1
+            continue
+        index += 1
+        if index >= len(value):
+            break
+        marker = value[index]
+        if marker == "u" and index + 4 < len(value):
+            digits = value[index + 1:index + 5]
+            if re.fullmatch(r"[0-9A-Fa-f]{4}", digits):
+                output.append(chr(int(digits, 16)))
+                index += 5
+                continue
+        output.append(escapes.get(marker, marker))
+        index += 1
+    return "".join(output)
+
+
+def read_properties(path: Path) -> dict[str, str]:
+    """Read key.properties with Java Properties semantics, not ad-hoc splitting."""
+    logical_lines = []
+    pending = ""
+    for physical in read(path).splitlines():
+        line = pending + (physical.lstrip() if pending else physical)
+        trailing_slashes = len(line) - len(line.rstrip("\\"))
+        if trailing_slashes % 2 == 1:
+            pending = line[:-1]
+            continue
+        logical_lines.append(line)
+        pending = ""
+    if pending:
+        logical_lines.append(pending)
+
+    result = {}
+    for raw_line in logical_lines:
+        line = raw_line.lstrip()
+        if not line or line[0] in "#!":
+            continue
+
+        escaped = False
+        separator = len(line)
+        for index, character in enumerate(line):
+            if not escaped and (character in "=:" or character.isspace()):
+                separator = index
+                break
+            if character == "\\":
+                escaped = not escaped
+            else:
+                escaped = False
+
+        value_start = separator
+        while value_start < len(line) and line[value_start].isspace():
+            value_start += 1
+        if value_start < len(line) and line[value_start] in "=:":
+            value_start += 1
+        while value_start < len(line) and line[value_start].isspace():
+            value_start += 1
+
+        key = _unescape_java_property(line[:separator])
+        value = _unescape_java_property(line[value_start:])
+        if key:
+            result[key] = value
+    return result
+
+
+def signing_package(app: Path) -> str:
+    package = config_setting(app, "package_name") or detect_android_package(app)
+    if not real_android_id(package):
+        die(f"no real Android applicationId found in {app}")
+    return package
+
+
+def resolve_store_file(
+    properties_path: Path,
+    properties: dict[str, str],
+    project_root: Path | None = None,
+) -> Path | None:
+    raw = properties.get("storeFile", "").strip()
+    if not raw:
+        return None
+    path = Path(os.path.expandvars(os.path.expanduser(raw)))
+    if path.is_absolute():
+        return path.resolve()
+    if project_root:
+        gradle = read(project_root / "android" / "app" / "build.gradle.kts")
+        gradle += "\n" + read(project_root / "android" / "app" / "build.gradle")
+        # Gradle's file(...) is relative to the app module, while
+        # rootProject.file(...) is relative to android/. Mirror what the build
+        # actually does instead of assuming paths are key.properties-relative.
+        base = (
+            project_root / "android"
+            if re.search(r"storeFile[^\n]{0,200}rootProject\.file", gradle)
+            else project_root / "android" / "app"
+        )
+        return (base / path).resolve()
+    return (properties_path.parent / path).resolve()
+
+
+def find_keytool() -> str | None:
+    candidates = []
+    java_home = os.environ.get("JAVA_HOME", "").strip()
+    if java_home:
+        candidates.append(Path(java_home) / "bin" / "keytool")
+    candidates += [
+        Path("/Applications/Android Studio.app/Contents/jbr/Contents/Home/bin/keytool"),
+        Path("/Applications/Android Studio.app/Contents/jre/Contents/Home/bin/keytool"),
+    ]
+    discovered = shutil.which("keytool")
+    if discovered:
+        candidates.append(Path(discovered))
+
+    for candidate in dict.fromkeys(path.resolve() for path in candidates):
+        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+            continue
+        probe = subprocess.run(
+            [str(candidate), "-help"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if probe.returncode == 0:
+            return str(candidate)
+    return None
+
+
+def probe_keystore_file(store: Path, properties: dict[str, str]) -> dict:
+    """Validate store password, alias, and private-key password without leaks."""
+    keytool = find_keytool()
+    if not keytool:
+        return {
+            "status": "unavailable",
+            "detail": "A JDK keytool was not found; install/configure Flutter's Android toolchain",
+            "fingerprint": None,
+        }
+
+    environment = os.environ.copy()
+    environment["FRK_STORE_PASSWORD"] = properties["storePassword"]
+    try:
+        result = subprocess.run(
+            [
+                keytool, "-list", "-v", "-keystore", str(store),
+                "-alias", properties["keyAlias"],
+                "-storepass:env", "FRK_STORE_PASSWORD",
+            ],
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=20,
+        )
+    except subprocess.TimeoutExpired:
+        return {"status": "invalid", "detail": "Keystore validation timed out", "fingerprint": None}
+    if result.returncode:
+        detail = next(
+            (line.strip() for line in (result.stderr + result.stdout).splitlines() if line.strip()),
+            "keytool rejected the file",
+        )
+        return {
+            "status": "invalid",
+            "detail": f"Store password, file, or keyAlias is incorrect: {detail}",
+            "fingerprint": None,
+        }
+    match = re.search(r"SHA(?:-|)256:\s*([A-Fa-f0-9:]+)", result.stdout)
+    fingerprint = match.group(1).upper() if match else None
+
+    java = Path(keytool).with_name("java")
+    if not java.is_file() or not os.access(java, os.X_OK):
+        return {
+            "status": "partial",
+            "detail": "Store password and alias are valid; the private-key password will be checked by the first release build",
+            "fingerprint": fingerprint,
+        }
+
+    # keytool -list never reads keyPassword. A tiny source-mode Java probe asks
+    # KeyStore for the private key, while every secret stays in the child
+    # environment rather than argv, generated source, logs, or the repository.
+    source = """\
+import java.io.File;
+import java.security.Key;
+import java.security.KeyStore;
+import java.security.PrivateKey;
+
+public class FRKKeyProbe {
+    public static void main(String[] args) throws Exception {
+        KeyStore store = KeyStore.getInstance(
+            new File(System.getenv("FRK_KEYSTORE_PATH")),
+            System.getenv("FRK_STORE_PASSWORD").toCharArray()
+        );
+        Key key = store.getKey(
+            System.getenv("FRK_KEY_ALIAS"),
+            System.getenv("FRK_KEY_PASSWORD").toCharArray()
+        );
+        if (!(key instanceof PrivateKey)) {
+            throw new IllegalStateException("the selected alias is not a private key");
+        }
+        System.out.println("FRK_KEY_OK");
+    }
+}
+"""
+    environment.update({
+        "FRK_KEYSTORE_PATH": str(store),
+        "FRK_KEY_ALIAS": properties["keyAlias"],
+        "FRK_KEY_PASSWORD": properties["keyPassword"],
+    })
+    try:
+        with tempfile.TemporaryDirectory(prefix="frk-key-probe-") as directory:
+            probe = Path(directory) / "FRKKeyProbe.java"
+            probe.write_text(source)
+            probe.chmod(0o600)
+            key_result = subprocess.run(
+                [str(java), str(probe)],
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=20,
+            )
+    except subprocess.TimeoutExpired:
+        return {"status": "invalid", "detail": "Private-key password validation timed out", "fingerprint": fingerprint}
+
+    if key_result.returncode or "FRK_KEY_OK" not in key_result.stdout:
+        lines = [line.strip() for line in (key_result.stderr + key_result.stdout).splitlines() if line.strip()]
+        detail = next(
+            (line for line in reversed(lines) if not line.startswith("at ")),
+            "the private key could not be opened",
+        )
+        return {
+            "status": "invalid",
+            "detail": f"keyPassword or keyAlias is incorrect: {detail}",
+            "fingerprint": fingerprint,
+        }
+    return {
+        "status": "valid",
+        "detail": "Store password, keyAlias, and private-key password are valid",
+        "fingerprint": fingerprint,
+    }
+
+
+def validate_keystore_file(store: Path, properties: dict[str, str]) -> str | None:
+    """Strict import-time wrapper around the non-terminating status probe."""
+    result = probe_keystore_file(store, properties)
+    if result["status"] == "invalid":
+        die(
+            "the selected keystore does not match key.properties: "
+            f"{result['detail']}"
+        )
+    if result["status"] in {"unavailable", "partial"}:
+        warn(result["detail"])
+    return result["fingerprint"]
+
+
+def git_tracks(app: Path, relative: str) -> bool:
+    if not shutil.which("git"):
+        return False
+    result = subprocess.run(
+        ["git", "-C", str(app), "ls-files", "--error-unmatch", relative],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+def git_ignores(app: Path, relative: str) -> bool:
+    if not shutil.which("git"):
+        return True
+    repo = subprocess.run(
+        ["git", "-C", str(app), "rev-parse", "--show-toplevel"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if repo.returncode:
+        return True
+    result = subprocess.run(
+        ["git", "-C", str(app), "check-ignore", "--no-index", "-q", "--", relative],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+def git_path_is_ignored_or_external(path: Path) -> bool:
+    """Outside a repository is safe; inside one must have an ignore rule."""
+    if not shutil.which("git"):
+        return True
+    root_result = subprocess.run(
+        ["git", "-C", str(path.parent), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+    )
+    if root_result.returncode:
+        return True
+    root = Path(root_result.stdout.strip()).resolve()
+    try:
+        relative = str(path.absolute().relative_to(root))
+    except ValueError:
+        return True
+    return git_ignores(root, relative)
+
+
+def git_tracks_path(path: Path) -> bool:
+    if not shutil.which("git") or not path.exists():
+        return False
+    root_result = subprocess.run(
+        ["git", "-C", str(path.parent), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+    )
+    if root_result.returncode:
+        return False
+    root = Path(root_result.stdout.strip()).resolve()
+    try:
+        relative = str(path.resolve().relative_to(root))
+    except ValueError:
+        return False
+    return git_tracks(root, relative)
+
+
+def cmd_signing_audit(args) -> int:
+    app = require_managed_app(args.app_dir)
+    _, platforms = config_summary(app)
+    if "android" not in platforms:
+        warn(f"{app.name} is not configured for Android; no upload key is needed")
+        return 0
+
+    package = signing_package(app)
+    props_path = app / "android" / "key.properties"
+    vault = SIGNING_DIR / package
+    head(f"Android signing — {package}")
+    info(f"project     {app}")
+    info(f"vault       {vault}")
+
+    status = android_setup_record(app, package)
+    problems = []
+    if not status["projectPropertiesExists"]:
+        problems.append("android/key.properties is missing")
+    elif not status["propertiesComplete"]:
+        problems.append(
+            f"key.properties is incomplete: {', '.join(status['missingPropertiesFields'])}"
+        )
+    else:
+        ok(f"key.properties is complete: {props_path}")
+
+    if not status["keystoreExists"]:
+        problems.append(
+            f"upload keystore is missing: {status['referencedKeystorePath'] or '(storeFile not set)'}"
+        )
+    elif status["keystoreValidationStatus"] == "valid":
+        ok(f"upload key credentials are valid: {status['referencedKeystorePath']}")
+        if status["certificateSHA256"]:
+            ok(f"upload certificate SHA-256: {status['certificateSHA256']}")
+    elif status["keystoreValidationStatus"] == "partial":
+        problems.append(status["keystoreValidationDetail"])
+    else:
+        problems.append(status["keystoreValidationDetail"])
+
+    if status["gradleConfigured"]:
+        ok(status["gradleConfigurationDetail"])
+    else:
+        problems.append(f"Gradle signing: {status['gradleConfigurationDetail']}")
+
+    if status["gitTracked"]:
+        problems.append("android/key.properties is tracked by Git — remove it from the index")
+    if status["keystoreGitTracked"]:
+        problems.append("the upload keystore is tracked by Git — remove it from the index and rotate it if pushed")
+    if not status["propertiesGitIgnored"]:
+        problems.append("android/key.properties is not protected by a .gitignore rule")
+    if not status["keystoreGitIgnored"]:
+        problems.append("the upload keystore is inside the repository but is not ignored")
+    if status["gitSafe"]:
+        ok("signing secrets are not tracked by Git")
+
+    if status["projectLinked"] and status["vaultReady"]:
+        ok("project uses the protected central signing entry")
+    elif status["vaultReady"]:
+        warn("central signing entry exists but this project is not linked to it")
+    else:
+        warn("signing works locally but is not yet protected in the central vault")
+
+    if problems:
+        for problem in problems:
+            fail(problem)
+        fail(f"{len(problems)} signing problem(s) found")
+        return 1
+    ok("Android signing is ready")
+    return 0
+
+
+def cmd_signing_import(args) -> int:
+    """Copy existing signing material into the vault; never delete the source."""
+    app = require_managed_app(args.app_dir)
+    package = signing_package(app)
+    source_props = (
+        Path(args.properties).expanduser().resolve()
+        if args.properties
+        else app / "android" / "key.properties"
+    )
+    if not source_props.is_file():
+        die(f"key.properties not found: {source_props}")
+
+    props = read_properties(source_props)
+    missing = [key for key in ANDROID_SIGNING_KEYS if not props.get(key)]
+    if missing:
+        die(
+            f"{source_props} is incomplete ({', '.join(missing)}). "
+            "Pass --properties pointing to the complete original key.properties."
+        )
+    selected_store = getattr(args, "keystore", None)
+    source_store = (
+        Path(selected_store).expanduser().resolve()
+        if selected_store
+        else resolve_store_file(
+            source_props,
+            props,
+            app if source_props.resolve() == (app / "android" / "key.properties").resolve() else None,
+        )
+    )
+    if not source_store or not source_store.is_file():
+        if selected_store:
+            die(f"selected keystore was not found: {source_store}")
+        die(f"keystore referenced by {source_props} was not found: {source_store}")
+    fingerprint = validate_keystore_file(source_store, props)
+
+    vault = SIGNING_DIR / package
+    ensure_private_dir(CREDENTIALS_DIR)
+    ensure_private_dir(SIGNING_DIR)
+    ensure_private_dir(vault)
+    suffix = source_store.suffix if source_store.suffix in (".jks", ".keystore") else ".jks"
+    target_store = vault / f"upload-keystore{suffix}"
+    target_props = vault / "key.properties"
+
+    if target_store.exists() and target_store.read_bytes() != source_store.read_bytes() and not args.force:
+        die(f"a different keystore already exists at {target_store}; inspect it or use --force")
+
+    source_content = source_props.read_text()
+    target_content, replacements = re.subn(
+        r"(?m)^\s*storeFile\s*=.*$",
+        f"storeFile={target_store.as_posix()}",
+        source_content,
+    )
+    if replacements == 0:
+        die(f"{source_props} has no replaceable storeFile entry")
+    if not target_content.endswith("\n"):
+        target_content += "\n"
+    if target_props.exists() and target_props.read_text() != target_content and not args.force:
+        die(f"different signing properties already exist at {target_props}; inspect them or use --force")
+
+    if not args.dry_run:
+        shutil.copy2(source_store, target_store)
+        target_store.chmod(0o600)
+        target_props.write_text(target_content)
+        target_props.chmod(0o600)
+
+    head(f"Import Android signing — {package}")
+    ok(f"source preserved: {source_props}")
+    if git_tracks_path(source_props) or git_tracks_path(source_store):
+        warn(
+            "the original signing file is tracked by Git; remove it from Git "
+            "and rotate the upload key if it was pushed"
+        )
+    (info if args.dry_run else ok)(f"{'would create' if args.dry_run else 'created'}: {target_store}")
+    (info if args.dry_run else ok)(f"{'would create' if args.dry_run else 'created'}: {target_props}")
+    if fingerprint:
+        ok(f"verified upload certificate SHA-256: {fingerprint}")
+    if not args.dry_run:
+        if getattr(args, "link", False):
+            return cmd_signing_link(argparse.Namespace(app_dir=str(app)))
+        info(f"next: frk signing link {app}")
+    return 0
+
+
+def cmd_signing_ios_setup(args) -> int:
+    """Create/reuse Apple signing material through the shared Fastlane lane."""
+    app = require_managed_app(args.app_dir)
+    _, platforms = config_summary(app)
+    if "ios" not in platforms:
+        die(f"{app.name} is not configured for iOS")
+    bundle = config_setting(app, "bundle_id")
+    team = config_setting(app, "team_id")
+    export_path = app / "ios" / "ExportOptions.plist"
+    export_status = ios_export_options_record(app, bundle, team)
+    if not export_status["ready"]:
+        if export_path.exists():
+            backup_dir = SIGNING_DIR / "ios" / team / "backups"
+            ensure_private_dir(backup_dir)
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            backup = backup_dir / f"{app.name}-ExportOptions-{stamp}.plist"
+            shutil.copy2(export_path, backup)
+            backup.chmod(0o600)
+            ok(f"previous ExportOptions.plist backed up: {backup}")
+        export_path.parent.mkdir(parents=True, exist_ok=True)
+        export_path.write_text(export_options_plist(team, bundle))
+        ok("generated app-specific ios/ExportOptions.plist")
+    return run_fastlane(app, ["ios", "setup_signing"], prevent_sleep=True)
+
+
+def cmd_signing_link(args) -> int:
+    """Point one project's ignored key.properties at its central vault entry."""
+    app = require_managed_app(args.app_dir)
+    package = signing_package(app)
+    vault = SIGNING_DIR / package
+    target_props = vault / "key.properties"
+    target_store = resolve_store_file(target_props, read_properties(target_props)) if target_props.is_file() else None
+    if not target_props.is_file() or not target_store or not target_store.is_file():
+        die(f"central signing entry is incomplete; run `frk signing import {app}` first")
+
+    project_props = app / "android" / "key.properties"
+    if project_props.is_symlink() and project_props.resolve() == target_props.resolve():
+        ok(f"already linked: {project_props} -> {target_props}")
+        return 0
+
+    ensure_private_dir(vault / "backups")
+    if project_props.exists() or project_props.is_symlink():
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        backup = vault / "backups" / f"{stamp}-project-key.properties"
+        if project_props.is_symlink():
+            backup.write_text(f"symlink={os.readlink(project_props)}\n")
+        else:
+            shutil.copy2(project_props, backup)
+        backup.chmod(0o600)
+        project_props.unlink()
+        ok(f"previous project file backed up: {backup}")
+
+    project_props.parent.mkdir(parents=True, exist_ok=True)
+    project_props.symlink_to(target_props)
+    ok(f"linked: {project_props} -> {target_props}")
+    if git_tracks(app, "android/key.properties"):
+        warn("this path is tracked by Git; run `git rm --cached android/key.properties` and commit the removal")
+    return 0
+
+
+def cmd_setup(args) -> int:
+    """Prepare the local, non-secret parts of the toolkit idempotently."""
+    head("Machine setup")
+
+    for directory in (
+        CREDENTIALS_DIR,
+        CREDENTIALS_DIR / "asc",
+        CREDENTIALS_DIR / "play",
+        SIGNING_DIR,
+    ):
+        ensure_private_dir(directory)
+    ok(f"private vault: {CREDENTIALS_DIR} (mode 700)")
+
+    env_file = CREDENTIALS_DIR / "credentials.env"
+    if env_file.exists():
+        if not env_file.is_file():
+            die(f"credentials path is not a file: {env_file}")
+        env_file.chmod(0o600)
+        ok(f"credentials template: {env_file} (kept existing file)")
+    else:
+        env_file.write_text(CREDENTIALS_ENV_TEMPLATE)
+        env_file.chmod(0o600)
+        ok(f"credentials template: {env_file}")
+
+    if REGISTRY_PATH.exists():
+        load_registry()
+        REGISTRY_PATH.chmod(0o600)
+        ok(f"project registry: {REGISTRY_PATH} (kept existing entries)")
+    else:
+        save_registry({"version": REGISTRY_VERSION, "projects": []})
+        ok(f"project registry: {REGISTRY_PATH}")
+
+    bin_dir = (
+        Path(args.bin_dir).expanduser().resolve()
+        if args.bin_dir
+        else Path.home() / ".local" / "bin"
+    )
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    command = bin_dir / "frk"
+    target = KIT_ROOT / "bin" / "frk"
+    link_ready = False
+    if command.is_symlink() and command.resolve() == target.resolve():
+        ok(f"command already installed: {command}")
+        link_ready = True
+    elif command.exists() or command.is_symlink():
+        fail(f"{command} already exists and was not changed")
+        info("remove or rename it, then run setup again; existing commands are never overwritten")
+    else:
+        command.symlink_to(target)
+        ok(f"command installed: {command} -> {target}")
+        link_ready = True
+
+    path_entries = {
+        Path(entry).expanduser().resolve()
+        for entry in os.environ.get("PATH", "").split(os.pathsep)
+        if entry
+    }
+    path_ready = bin_dir.resolve() in path_entries
+    if path_ready:
+        ok(f"PATH includes {bin_dir}")
+    else:
+        warn(f"PATH does not include {bin_dir}")
+        info(f'add this to your shell profile: export PATH="{bin_dir}:$PATH"')
+
+    head("Tools")
+    missing = []
+    for tool, purpose in (("flutter", "Flutter builds"), ("fastlane", "store releases")):
+        location = shutil.which(tool)
+        if location:
+            ok(f"{tool}: {location}")
+        else:
+            missing.append(tool)
+            warn(f"{tool} not found — required for {purpose}")
+    if "fastlane" in missing and shutil.which("brew"):
+        info("install Fastlane with: brew install fastlane")
+
+    head("Next")
+    info(f"1. Add store credentials when needed: {env_file}")
+    info("2. Add one app: frk onboard /path/to/app")
+    info("3. Check it:    frk doctor example_app")
+    if not path_ready:
+        info(f"Until PATH is updated, run: {command} COMMAND")
+
+    return 0 if link_ready else 1
+
+
+def cmd_status(args) -> int:
+    head("Kit")
+    info(f"version     {VERSION}")
+    info(f"root        {KIT_ROOT}")
+    fastfile = KIT_ROOT / "fastlane" / "Fastfile"
+    (ok if fastfile.is_file() else fail)(f"shared Fastfile ({sum(1 for _ in open(fastfile))} lines)"
+                                         if fastfile.is_file() else "shared Fastfile MISSING")
+
+    head("Shared credentials")
+    info(f"dir         {CREDENTIALS_DIR}")
+    if not CREDENTIALS_DIR.is_dir():
+        fail("directory does not exist — see docs/ONBOARDING.md")
+        return 1
+
+    mode = oct(CREDENTIALS_DIR.stat().st_mode)[-3:]
+    (ok if mode == "700" else warn)(f"permissions {mode}" + ("" if mode == "700" else " (expected 700)"))
+
+    for private_dir in (CREDENTIALS_DIR / "asc", CREDENTIALS_DIR / "play", SIGNING_DIR):
+        if private_dir.is_dir():
+            child_mode = private_dir.stat().st_mode & 0o777
+            (ok if child_mode == 0o700 else warn)(
+                f"{private_dir.name}/ permissions {child_mode:03o}"
+                + ("" if child_mode == 0o700 else " (expected 700)")
+            )
+
+    env_file = CREDENTIALS_DIR / "credentials.env"
+    if env_file.is_file():
+        keys = [l.split("=")[0].strip() for l in read(env_file).splitlines()
+                if l.strip() and not l.strip().startswith("#") and "=" in l]
+        if keys:
+            ok(f"credentials.env — sets {', '.join(keys)}")
+        else:
+            warn("credentials.env has no active entries — configure only the stores you use")
+    else:
+        fail("credentials.env missing")
+
+    sensitive_files = [env_file, REGISTRY_PATH]
+    sensitive_files += list((CREDENTIALS_DIR / "asc").glob("*.p8"))
+    sensitive_files += list((CREDENTIALS_DIR / "play").glob("*.json"))
+    sensitive_files += list(SIGNING_DIR.glob("**/key.properties"))
+    sensitive_files += list(SIGNING_DIR.glob("**/*.jks"))
+    sensitive_files += list(SIGNING_DIR.glob("**/*.keystore"))
+    loose = [path for path in sensitive_files if path.is_file() and path.stat().st_mode & 0o077]
+    if loose:
+        for path in loose:
+            warn(f"sensitive file permissions {path.stat().st_mode & 0o777:03o}: {path}")
+    else:
+        ok("sensitive files are private (no group/world access)")
+
+    p8s = list((CREDENTIALS_DIR / "asc").glob("AuthKey_*.p8"))
+    (ok if p8s else warn)(f"App Store Connect keys: {len(p8s)}"
+                          + (f" ({', '.join(p.name for p in p8s)})" if p8s else " — iOS uploads will fail"))
+
+    plays = list((CREDENTIALS_DIR / "play").glob("*.json"))
+    (ok if plays else warn)(
+        f"Play service accounts: {len(plays)}"
+        + (f" ({', '.join(p.name for p in plays)})" if plays else " — Android uploads will fail")
+    )
+
+    projects = managed_projects()
+    ok(f"managed projects: {len(projects)} (opt-in registry: {REGISTRY_PATH})")
+    signing_entries = list(SIGNING_DIR.glob("*/key.properties")) if SIGNING_DIR.is_dir() else []
+    (ok if signing_entries else warn)(f"central Android signing entries: {len(signing_entries)}")
+
+    head("Signing identities (account-level, shared by all iOS apps)")
+    if shutil.which("security") is None:
+        warn("macOS `security` command unavailable — iOS signing cannot be checked on this machine")
+        return 0
+    out = subprocess.run(["security", "find-identity", "-v", "-p", "codesigning"],
+                         capture_output=True, text=True).stdout
+    names = re.findall(r'"([^"]+)"', out)
+    if any("Distribution" in n for n in names):
+        for n in names:
+            if "Distribution" in n:
+                ok(n)
+    else:
+        fail("no Apple Distribution identity — run `fastlane ios setup_signing` in any iOS app")
+    return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="frk", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version", version=f"frk {VERSION}")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    setup = sub.add_parser("setup", help="prepare this machine for Flutter Release Kit")
+    setup.add_argument("--bin-dir", help="command installation directory (default: ~/.local/bin)")
+    setup.set_defaults(func=cmd_setup)
+
+    ob = sub.add_parser("onboard", help="add an app to the shared release automation")
+    ob.add_argument("app_dir", nargs="?", default=".")
+    ob.add_argument("--name", help="app name for the config (default: directory name)")
+    ob.add_argument("--platforms", help="override detection, e.g. android or android,ios")
+    ob.add_argument("--android-package", help="explicit applicationId when Gradle computes it dynamically")
+    ob.add_argument("--ios-bundle-id", help="explicit bundle id when Xcode detection is insufficient")
+    ob.add_argument("--ios-team-id", help="explicit Apple Developer team id")
+    ob.add_argument("--track", default="internal", choices=["internal", "alpha", "beta"],
+                    help="Play testing track (default: internal)")
+    ob.add_argument("--force", action="store_true", help="overwrite existing files")
+    ob.add_argument("--dry-run", action="store_true", help="show what would change")
+    ob.set_defaults(func=cmd_onboard)
+
+    dc = sub.add_parser("doctor", help="validate an onboarded app")
+    dc.add_argument("app_dir", nargs="?", default=".", help="path or managed app name (default: current directory)")
+    dc.set_defaults(func=cmd_doctor)
+
+    vf = sub.add_parser("verify", help="run flutter analyze and flutter test")
+    vf.add_argument("app_dir", nargs="?", default=".", help="path or managed app name")
+    vf.set_defaults(func=cmd_verify)
+
+    def add_release_arguments(parser, *, is_release: bool):
+        parser.add_argument("platform", choices=["android", "ios", "all"])
+        parser.add_argument("app_dir", nargs="?", default=".", help="path or managed app name")
+        parser.add_argument("--build-name", help="marketing version, e.g. 2.1.0")
+        parser.add_argument("--build-number", help="store build number/versionCode")
+        if is_release:
+            parser.add_argument("--skip-tests", action="store_true")
+            parser.add_argument("--skip-build", action="store_true")
+            parser.add_argument(
+                "--dry-run",
+                action="store_true",
+                help="send the Android bundle to Play for validation only; never releases it to a track",
+            )
+
+    bd = sub.add_parser("build", help="build release AAB/IPA without uploading")
+    add_release_arguments(bd, is_release=False)
+    bd.set_defaults(func=cmd_build)
+
+    rl = sub.add_parser("release", help="upload to Play testing and/or TestFlight")
+    add_release_arguments(rl, is_release=True)
+    rl.set_defaults(func=cmd_release)
+
+    ls = sub.add_parser("list", help="show only explicitly managed apps")
+    ls.set_defaults(func=cmd_list)
+
+    fg = sub.add_parser("forget", help="remove an app from the registry; change no project files")
+    fg.add_argument("app_dir", nargs="?", default=".", help="path or managed app name")
+    fg.set_defaults(func=cmd_forget)
+
+    st = sub.add_parser("status", help="show kit and shared credential state")
+    st.set_defaults(func=cmd_status)
+
+    api = sub.add_parser("api", help="versioned machine API for desktop and automation clients")
+    api_sub = api.add_subparsers(dest="api_cmd", required=True)
+
+    api_cap = api_sub.add_parser("capabilities", help="print protocol and feature information as JSON")
+    api_cap.set_defaults(func=cmd_api_capabilities)
+
+    api_projects = api_sub.add_parser("projects", help="print managed project summaries as JSON")
+    api_projects.set_defaults(func=cmd_api_projects)
+
+    api_project = api_sub.add_parser("project", help="print one managed project as JSON")
+    api_project.add_argument("app_dir", help="path or managed app name")
+    api_project.set_defaults(func=cmd_api_project)
+
+    api_setup = api_sub.add_parser("setup", help="print structured release-setup diagnostics as JSON")
+    api_setup.add_argument("app_dir", help="path or managed app name")
+    api_setup.set_defaults(func=cmd_api_setup)
+
+    api_credentials = api_sub.add_parser(
+        "credentials",
+        help="print shared store-credential readiness without secret values",
+    )
+    api_credentials.set_defaults(func=cmd_api_credentials)
+
+    api_configure = api_sub.add_parser(
+        "configure-credentials",
+        help="validate and copy one store credential into the private vault",
+    )
+    api_configure.add_argument("store", choices=["google-play", "app-store"])
+    api_configure.add_argument("--file", required=True, help="source JSON or .p8 file; never deleted")
+    api_configure.add_argument("--key-id", help="App Store Connect key id")
+    api_configure.add_argument("--issuer-id", help="App Store Connect issuer id")
+    api_configure.add_argument("--force", action="store_true", help="replace a different vault copy")
+    api_configure.set_defaults(func=cmd_api_configure_credentials)
+
+    api_run = api_sub.add_parser("run", help="run one stable action and stream JSON Lines events")
+    api_run.add_argument(
+        "action",
+        choices=[
+            "onboard", "doctor", "verify", "build", "validate",
+            "release", "signing-audit", "signing-import", "signing-link",
+            "ios-setup-signing", "status", "forget",
+        ],
+    )
+    api_run.add_argument("app_dir", nargs="?", help="path or managed app name")
+    api_run.add_argument("--platform", choices=["android", "ios", "all"])
+    api_run.add_argument("--build-name")
+    api_run.add_argument("--build-number")
+    api_run.add_argument("--skip-tests", action="store_true")
+    api_run.add_argument("--skip-build", action="store_true")
+    api_run.add_argument("--name", help="onboard: stable managed-project name")
+    api_run.add_argument("--platforms", help="onboard: android, ios, or android,ios")
+    api_run.add_argument("--android-package", help="onboard: explicit Android applicationId")
+    api_run.add_argument("--ios-bundle-id", help="onboard: explicit iOS bundle identifier")
+    api_run.add_argument("--ios-team-id", help="onboard: explicit Apple developer team id")
+    api_run.add_argument("--track", choices=["internal", "alpha", "beta"])
+    api_run.add_argument("--properties", help="signing-import: source key.properties")
+    api_run.add_argument("--keystore", help="signing-import: selected .jks or .keystore")
+    api_run.add_argument("--force", action="store_true", help="signing-import: replace a different vault copy")
+    api_run.add_argument("--link", action="store_true", help="signing-import: link the project after copying")
+    api_run.add_argument("--dry-run", action="store_true", help="onboard preview only")
+    api_run.set_defaults(func=cmd_api_run)
+
+    sg = sub.add_parser("signing", help="manage central Android upload keys")
+    sg_sub = sg.add_subparsers(dest="signing_cmd", required=True)
+
+    audit = sg_sub.add_parser("audit", help="inspect signing without changing anything")
+    audit.add_argument("app_dir", nargs="?", default=".", help="path or managed app name")
+    audit.set_defaults(func=cmd_signing_audit)
+
+    imp = sg_sub.add_parser("import", help="copy an existing upload key into the private vault")
+    imp.add_argument("app_dir", nargs="?", default=".", help="path or managed app name")
+    imp.add_argument("--properties", help="complete source key.properties (default: app/android/key.properties)")
+    imp.add_argument("--keystore", help="keystore to pair with the selected/default key.properties")
+    imp.add_argument("--force", action="store_true", help="replace an existing vault copy")
+    imp.add_argument("--link", action="store_true", help="link the project to the vault after a successful import")
+    imp.add_argument("--dry-run", action="store_true", help="show what would be copied")
+    imp.set_defaults(func=cmd_signing_import)
+
+    link = sg_sub.add_parser("link", help="link an app to its central Android signing entry")
+    link.add_argument("app_dir", nargs="?", default=".", help="path or managed app name")
+    link.set_defaults(func=cmd_signing_link)
+
+    ios_setup = sg_sub.add_parser(
+        "ios-setup",
+        help="create or refresh the Apple Distribution certificate and app profile",
+    )
+    ios_setup.add_argument("app_dir", nargs="?", default=".", help="path or managed app name")
+    ios_setup.set_defaults(func=cmd_signing_ios_setup)
+
+    args = p.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

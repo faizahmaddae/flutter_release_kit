@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Python syntax
+        run: python3 -m py_compile bin/frk
+      - name: CLI tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Fastfile syntax
+        run: ruby -c fastlane/Fastfile

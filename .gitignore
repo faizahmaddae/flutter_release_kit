@@ -1,0 +1,30 @@
+# The kit itself must never hold a credential — they live in ~/.flutter-release/.
+# These rules are a backstop in case one is ever copied here by mistake.
+*.jks
+*.keystore
+*.p12
+*.p8
+*.pem
+*.cer
+*.certSigningRequest
+*.mobileprovision
+AuthKey_*.p8
+credentials.env
+.env
+.env.*
+
+# Fastlane run artefacts
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/README.md
+fastlane/test_output
+
+# Python
+__pycache__/
+*.pyc
+
+# Native macOS desktop build output
+desktop/ReleaseKitApp/.build/
+desktop/ReleaseKitApp/dist/
+
+.DS_Store

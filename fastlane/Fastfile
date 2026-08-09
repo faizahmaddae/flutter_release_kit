@@ -1,0 +1,1450 @@
+# =============================================================================
+# Flutter Release Kit — shared Fastfile
+# =============================================================================
+#
+# This file is NOT meant to be run directly. Each app imports it from its own
+# tiny fastlane/Fastfile, and supplies its identifiers via fastlane/release_kit.yml.
+#
+#   fastlane android release   Build the AAB and upload it to Play Internal Testing
+#   fastlane ios release       Build the IPA and upload it to TestFlight
+#   fastlane upload_all        Both platforms in one run
+#   fastlane verify            flutter analyze + flutter test
+#   fastlane doctor            Validate this app's whole release setup
+#
+# Nothing here can publish to the public: Play uploads are pinned to a testing
+# track and TestFlight runs with skip_submission. Promoting is a manual console
+# step, by design.
+#
+# No credential value is ever written into this file, or into any app repo.
+# Account-level credentials live in ~/.flutter-release/ (see docs/ONBOARDING.md).
+# =============================================================================
+
+require "shellwords"
+require "json"
+require "yaml"
+require "fileutils"
+require "pathname"
+
+fastlane_version "2.220.0"
+opt_out_usage
+skip_docs
+
+# PROJECT_ROOT is the *app's* root, not the kit's: fastlane resolves its folder
+# from the working directory, so an imported Fastfile still sees the app.
+PROJECT_ROOT   = File.expand_path("..", FastlaneCore::FastlaneFolder.path.to_s)
+FLUTTER_BIN    = ENV.fetch("FLUTTER_BIN", "flutter")
+SYMBOLS_DIR    = "build/symbols".freeze
+AAB_GLOB       = "build/app/outputs/bundle/release/*.aab".freeze
+IPA_GLOB       = "build/ios/ipa/*.ipa".freeze
+EXPORT_OPTIONS = "ios/ExportOptions.plist".freeze
+
+# Where account-level credentials live, shared by every app. Overridable so a
+# CI box or a second developer account can point somewhere else.
+SHARED_CREDENTIALS_DIR = File.expand_path(
+  ENV.fetch("FLUTTER_RELEASE_HOME", "~/.flutter-release")
+).freeze
+
+# -----------------------------------------------------------------------------
+# Cross-platform lanes
+# -----------------------------------------------------------------------------
+
+# Named `verify` rather than `test` on purpose: a lane called `test` cannot be
+# invoked from inside another lane, because Ruby's `Kernel#test` shadows it.
+desc "Run the project's quality gate: flutter analyze + flutter test"
+lane :verify do
+  flutter("pub get")
+  # Many trees carry info-level lints, and `flutter analyze` exits 1 on those
+  # unless infos are explicitly non-fatal. Gate on real errors, so a release is
+  # never blocked by a style hint.
+  flutter("analyze --no-fatal-infos --no-fatal-warnings")
+  flutter("test") if Dir.exist?(abs("test"))
+end
+
+desc "Validate this app's entire release setup without building anything"
+lane :doctor do
+  cfg = config
+  UI.header("#{cfg['name']} — release setup")
+  UI.message("Platforms      : #{platforms.join(', ')}")
+  UI.message("pubspec version: #{pubspec_version}")
+  UI.message("Kit            : #{KIT_ROOT}")
+  UI.message("Credentials    : #{SHARED_CREDENTIALS_DIR}")
+
+  problems = []
+
+  if android?
+    UI.header("Android")
+    UI.message("package_name: #{android_package}")
+    UI.message("track       : #{android_track}")
+    begin
+      preflight_android_signing
+      UI.success("Signing: android/key.properties and keystore present")
+    rescue StandardError => e
+      problems << "Android signing: #{e.message.lines.first.to_s.strip}"
+    end
+    begin
+      status = play_status(play_store_json_key)
+      if status[:ok]
+        UI.success("Play: edit access to #{android_package} confirmed")
+        used = status[:uploaded_codes]
+        UI.message("Highest versionCode uploaded: #{used.empty? ? 'none' : used.max}")
+        UI.important("Next Android build must use build_number:#{used.max + 1} or higher") unless used.empty?
+      elsif status[:missing]
+        problems << "Play: #{status[:message].to_s.lines.first.to_s.strip} — " \
+                    "create the listing in Play Console (the API cannot), or grant " \
+                    "the service account access to it. See `fastlane android check_credentials`."
+      else
+        problems << "Play access to #{android_package}: #{status[:message].to_s.lines.first.to_s.strip}"
+      end
+    rescue StandardError => e
+      problems << "Play credentials: #{e.message.lines.first.to_s.strip}"
+    end
+  end
+
+  if ios?
+    UI.header("iOS")
+    UI.message("bundle_id: #{ios_bundle_id}")
+    UI.message("team_id  : #{ios_team_id}")
+    unless File.file?(abs(EXPORT_OPTIONS))
+      problems << "#{EXPORT_OPTIONS} missing — run `frk onboard` to generate it"
+    end
+    begin
+      preflight_ios_signing
+      UI.success("Signing: Apple Distribution identity present in the keychain")
+    rescue StandardError => e
+      problems << "iOS signing: #{e.message.lines.first.to_s.strip}"
+    end
+    begin
+      builds = testflight_builds(asc_api_key, limit: 5)
+      UI.success("App Store Connect: #{ios_bundle_id} reachable")
+      if builds.empty?
+        UI.message("TestFlight: no builds yet")
+      else
+        b = builds.first
+        UI.message("Latest TestFlight build: #{b.app_version} (#{b.version}) #{b.processing_state}")
+      end
+    rescue StandardError => e
+      problems << "App Store Connect: #{e.message.lines.first.to_s.strip}"
+    end
+  end
+
+  if problems.empty?
+    UI.success("\nAll checks passed — this app is ready to release.")
+  else
+    UI.error("\n#{problems.count} problem(s) found:")
+    problems.each { |p| UI.error("  - #{p}") }
+    UI.user_error!("Release setup is incomplete. See docs/ONBOARDING.md.")
+  end
+end
+
+# NOTE: despite the name, this does NOT publish to the public. It uploads to
+# testers on whichever platforms this app supports.
+desc "Upload release builds of every configured platform to testers"
+desc "Android -> Play testing track, iOS -> TestFlight. Never production."
+desc "Options: skip_android:true skip_ios:true skip_tests:true dry_run:true"
+lane :upload_all do |options|
+  verify unless truthy?(options[:skip_tests])
+
+  # Tests already ran once above; don't repeat them per platform.
+  child = options.merge(skip_tests: true)
+  done = []
+
+  if android? && !truthy?(options[:skip_android])
+    runner.execute(:upload_internal, :android, child)
+    done << "Android"
+  end
+  if ios? && !truthy?(options[:skip_ios])
+    runner.execute(:upload_testflight, :ios, child)
+    done << "iOS"
+  end
+
+  UI.user_error!("Nothing to upload — check `platforms` in fastlane/release_kit.yml") if done.empty?
+  UI.success("#{done.join(' + ')} uploaded to testers. Promote in the consoles to go live.")
+end
+
+desc "Alias for `upload_all` — note this uploads to TESTERS, not production"
+lane :release do |options|
+  upload_all(options)
+end
+
+# -----------------------------------------------------------------------------
+# Android
+# -----------------------------------------------------------------------------
+
+platform :android do
+  desc "Build a release App Bundle"
+  desc "Options: build_name:1.5.7 build_number:57"
+  lane :build_aab do |options|
+    require_platform!(:android)
+
+    args = ["build", "appbundle", "--release"]
+    args += ["--obfuscate", "--split-debug-info=#{SYMBOLS_DIR}"] if obfuscate?
+    args.concat(version_args(options, "ANDROID"))
+
+    preflight_android_signing
+    flutter("pub get")
+    flutter(args.join(" "))
+
+    aab = newest(AAB_GLOB) or UI.user_error!("Build reported success but no .aab was found at #{AAB_GLOB}")
+    UI.success("App Bundle: #{aab}")
+    upload_crashlytics_symbols if truthy?(ENV["UPLOAD_CRASHLYTICS_SYMBOLS"]) && obfuscate?
+    aab
+  end
+
+  desc "Build a release AAB and upload it to a Google Play TESTING track"
+  desc "Builds a full production-grade bundle (release, release-signed)."
+  desc "Only the destination is testers — this never touches the production track."
+  desc "Options: build_name: build_number: dry_run:true skip_build:true skip_tests:true"
+  private_lane :upload_internal do |options|
+    require_platform!(:android)
+    reject_version_override_with_skip_build!(options, "ANDROID")
+
+    # Resolve credentials and check the version code up front: both can fail,
+    # and neither is worth discovering after a multi-minute release build.
+    json_key = play_store_json_key
+    # Without rebuilding we cannot reliably infer an AAB's versionCode from
+    # pubspec.yaml. Let Play validate the selected artifact instead of blocking
+    # a valid bundle because the source version later changed.
+    warn_if_version_code_not_higher(options, json_key) unless truthy?(options[:skip_build])
+
+    verify unless truthy?(options[:skip_tests])
+
+    aab = truthy?(options[:skip_build]) ? newest(AAB_GLOB) : build_aab(options)
+    UI.user_error!("No .aab to upload — run `fastlane android build_aab` first") if aab.nil?
+
+    dry_run = truthy?(options[:dry_run])
+    UI.important("DRY RUN — Play will validate the bundle and discard it") if dry_run
+
+    # Guard against a misconfigured track ever reaching the public.
+    track = android_track
+    UI.user_error!("Refusing to upload: track '#{track}' is not a testing track") if track == "production"
+
+    upload_to_play_store(
+      package_name: android_package,
+      json_key: json_key,
+      aab: aab,
+      track: track,
+      release_status: "completed",
+      validate_only: dry_run,
+      skip_upload_apk: true,
+      skip_upload_metadata: true,
+      skip_upload_images: true,
+      skip_upload_screenshots: true,
+      skip_upload_changelogs: true
+    )
+
+    UI.success(dry_run ? "Play validation passed" : "Uploaded to Play (#{track} track)")
+  end
+
+  desc "Build a release AAB and upload it to the Play testing track"
+  desc "Options: build_name: build_number: dry_run:true skip_build:true skip_tests:true"
+  lane :release do |options|
+    upload_internal(options)
+  end
+
+  desc "Alias for `release`, naming the destination track explicitly"
+  lane :internal do |options|
+    upload_internal(options)
+  end
+
+  desc "Alias for `release` — the conventional Fastlane lane name"
+  lane :beta do |options|
+    upload_internal(options)
+  end
+
+  desc "Upload the last built AAB to Play without publishing it (validation only)"
+  lane :validate do |options|
+    upload_internal(options.merge(dry_run: true, skip_build: true, skip_tests: true))
+  end
+
+  desc "Check that the Google Play service account can reach this app"
+  lane :check_credentials do
+    require_platform!(:android)
+    key = play_store_json_key
+    validate_play_store_json_key(json_key: key)
+    UI.success("Authenticated with Google Play: #{key}")
+
+    # Authenticating only proves the key is valid. Opening an edit on the app is
+    # what proves the service account was actually granted access to *this* app.
+    status = play_status(key)
+
+    if !status[:ok] && status[:denied]
+      UI.user_error!(<<~MSG)
+        The service account authenticates, but Google Play denied access to
+        #{android_package}:
+
+          #{status[:message]}
+
+        Grant it access:
+          Play Console > Users and permissions > Invite new user (or edit the
+          existing service-account user)
+            email:  #{service_account_email(key)}
+            App permissions: add #{android_package}
+            Permissions: "Release to testing tracks, excluding production"
+          then Invite user / Apply.
+
+        Play grants are PER APP — a key that works for one of your apps says
+        nothing about another. Also confirm the Google Play Android Developer API
+        is enabled for the key's Google Cloud project.
+      MSG
+    elsif !status[:ok] && status[:missing]
+      UI.user_error!(<<~MSG)
+        Google Play has no app with the package name #{android_package}:
+
+          #{status[:message]}
+
+        The Publishing API cannot create an app — it only ever updates one that
+        already exists. Create the listing first:
+
+          Play Console > Create app > set the package name to
+          #{android_package} when you upload the first bundle.
+
+        Play returns this same 404 when the app exists but the service account
+        was never granted access to it, so if you are sure the listing is there,
+        grant access instead:
+          Play Console > Users and permissions > App permissions
+            email: #{service_account_email(key)}
+
+        A brand-new listing may also require its very first bundle to go through
+        the Console by hand; every release after that can use this lane.
+      MSG
+    elsif !status[:ok]
+      UI.user_error!("Reached Google Play but the request failed: #{status[:message]}")
+    end
+
+    UI.success("Edit access to #{android_package} confirmed — uploads will work.")
+    UI.message("Track '#{android_track}' version codes: #{status[:internal_codes].empty? ? 'none (track is empty)' : status[:internal_codes].join(', ')}")
+    used = status[:uploaded_codes]
+    UI.message("Highest version code ever uploaded: #{used.empty? ? 'none' : used.max}")
+    UI.important("Next Android build must use build_number:#{used.max + 1} or higher") unless used.empty?
+  end
+end
+
+# -----------------------------------------------------------------------------
+# iOS
+# -----------------------------------------------------------------------------
+
+platform :ios do
+  desc "Build a signed release IPA"
+  desc "Options: build_name:1.2.0 build_number:8"
+  lane :build_ipa do |options|
+    require_platform!(:ios)
+    ensure_export_options!
+    preflight_ios_signing
+
+    args = ["build", "ipa", "--release", "--export-options-plist=#{EXPORT_OPTIONS}"]
+    args.concat(version_args(options, "IOS"))
+
+    flutter("pub get")
+    flutter(args.join(" "))
+
+    ipa = newest(IPA_GLOB) or UI.user_error!(
+      "Build reported success but no .ipa was found at #{IPA_GLOB}. " \
+      "Check that #{EXPORT_OPTIONS} has <key>destination</key><string>export</string>."
+    )
+    UI.success("IPA: #{ipa}")
+    ipa
+  end
+
+  desc "Build a release IPA and upload it to TESTFLIGHT"
+  desc "Builds a full production-grade IPA (release, release-signed) — the very"
+  desc "same binary Apple reviews. Only the destination is testers; this never"
+  desc "submits for App Store review."
+  desc "Options: build_name: build_number: skip_build:true skip_tests:true"
+  private_lane :upload_testflight do |options|
+    require_platform!(:ios)
+    reject_version_override_with_skip_build!(options, "IOS")
+
+    # Credentials and build number first: both can fail, and neither is worth
+    # discovering after an archive. For upload-only, trust the IPA's embedded
+    # version rather than today's pubspec.yaml.
+    api_key = asc_api_key
+    existing_ipa = truthy?(options[:skip_build]) ? newest(IPA_GLOB) : nil
+    UI.user_error!("No .ipa to upload — run `fastlane ios build_ipa` first") if truthy?(options[:skip_build]) && existing_ipa.nil?
+    check_options = options
+    if existing_ipa && (embedded = ipa_version(existing_ipa))
+      check_options = options.merge(build_name: embedded[0], build_number: embedded[1])
+    end
+    warn_if_testflight_build_taken(check_options, api_key)
+
+    verify unless truthy?(options[:skip_tests])
+
+    ipa = truthy?(options[:skip_build]) ? existing_ipa : build_ipa(options)
+    UI.user_error!("No .ipa to upload — run `fastlane ios build_ipa` first") if ipa.nil?
+
+    # Trust the artifact, not the request. Xcode can rewrite CFBundleVersion
+    # during export, so this is the only version that means anything downstream.
+    actual_name, actual_number = ipa_version(ipa) || ios_version(options)
+    requested_name, requested_number = ios_version(options)
+    if actual_number != requested_number || actual_name != requested_name
+      UI.important("Xcode shipped #{actual_name} (#{actual_number}), not the requested " \
+                   "#{requested_name} (#{requested_number}) — using the artifact's version")
+    end
+    UI.message("Uploading #{File.basename(ipa)} — version #{actual_name}, build #{actual_number}")
+
+    changelog = ENV["TESTFLIGHT_CHANGELOG"].to_s.strip
+    wait = !changelog.empty? # `changelog` is only applied once processing finishes
+
+    # Apple's default Transporter path has repeatedly stalled: 88 MB uploads
+    # that complete in ~100s over DAV ran 45-80 minutes without finishing on the
+    # default transport. DAV is Apple's plain-HTTP transport and is the
+    # documented fallback for slow or lossy links.
+    #   Escape hatch: TESTFLIGHT_TRANSPORT=default (or any other -t value)
+    transport = ENV.fetch("TESTFLIGHT_TRANSPORT", "DAV")
+    unless transport == "default"
+      ENV["DELIVER_ITMSTRANSPORTER_ADDITIONAL_UPLOAD_PARAMETERS"] = "-t #{transport}"
+      UI.message("Transporter mode: -t #{transport}")
+    end
+
+    upload_to_testflight_with_retry(
+      api_key: api_key,
+      ipa: ipa,
+      version: actual_name,
+      number: actual_number,
+      wait: wait,
+      changelog: changelog
+    )
+  end
+
+  desc "Build a release IPA and upload it to TESTFLIGHT"
+  desc "Options: build_name: build_number: skip_build:true skip_tests:true"
+  lane :release do |options|
+    upload_testflight(options)
+  end
+
+  desc "Alias for `release` — the conventional Fastlane lane name"
+  lane :beta do |options|
+    upload_testflight(options)
+  end
+
+  desc "Upload the last built IPA to TestFlight without rebuilding"
+  lane :upload_only do |options|
+    upload_testflight(options.merge(skip_build: true, skip_tests: true))
+  end
+
+  desc "Run App Store Connect's static validation on the last built IPA"
+  lane :validate do
+    require_platform!(:ios)
+    ipa = newest(IPA_GLOB) or UI.user_error!("No .ipa found — run `fastlane ios build_ipa` first")
+    key = asc_key_parts
+    UI.user_error!("`ios validate` needs ASC_KEY_FILEPATH (a .p8 on disk), not ASC_KEY_CONTENT") if key[:filepath].empty?
+
+    # `altool --validate-app` is what App Store Connect runs before accepting a
+    # build. altool only looks for the .p8 in a handful of fixed directories,
+    # so point it at wherever ours actually lives.
+    sh({ "API_PRIVATE_KEYS_DIR" => File.dirname(key[:filepath]) },
+       "xcrun altool --validate-app -f #{ipa.shellescape} -t ios " \
+       "--apiKey #{key[:key_id].shellescape} --apiIssuer #{key[:issuer_id].shellescape}")
+    UI.success("IPA passed App Store Connect validation")
+  end
+
+  desc "Check that the App Store Connect API key works for this app"
+  lane :check_credentials do
+    require_platform!(:ios)
+    api_key = asc_api_key
+    # Loading the key proves nothing — a wrong issuer id loads fine. Make a real
+    # API call so the key id, issuer id and .p8 are all verified together.
+    builds = testflight_builds(api_key, limit: 5)
+    UI.success("App Store Connect reachable with key #{asc_key_parts[:key_id]}")
+    if builds.empty?
+      UI.message("TestFlight: no builds for #{ios_bundle_id} yet")
+    else
+      b = builds.first
+      UI.message("Latest TestFlight build: #{b.app_version} (#{b.version}) #{b.processing_state}")
+      UI.important("Next iOS build for #{b.app_version} must use build_number:#{b.version.to_i + 1} or higher")
+    end
+  end
+
+  desc "Create (or reuse) the Apple Distribution certificate and App Store profile"
+  desc "Driven entirely by the App Store Connect API key — no Xcode account session needed."
+  lane :setup_signing do
+    require_platform!(:ios)
+    api_key = asc_api_key
+
+    # The certificate is ACCOUNT-level and shared by every app on the team, so
+    # this normally reuses an existing one. Apple caps distribution certificates
+    # and never re-issues a private key — back up the .p12 this writes.
+    cert(
+      api_key: api_key,
+      development: false,
+      team_id: ios_team_id,
+      output_path: signing_output_dir
+    )
+
+    # The provisioning profile IS per app.
+    sigh(
+      api_key: api_key,
+      app_identifier: ios_bundle_id,
+      team_id: ios_team_id,
+      platform: "ios",
+      provisioning_name: ios_profile_name,
+      filename: ios_profile_filename,
+      output_path: signing_output_dir
+    )
+
+    UI.success("Certificate: #{Actions.lane_context[SharedValues::CERT_CERTIFICATE_ID]}")
+    UI.success("Profile: #{Actions.lane_context[SharedValues::SIGH_NAME]}")
+    UI.important("Back up #{signing_output_dir}/*.p12 — Apple never re-issues a private key")
+  end
+
+  desc "List recent TestFlight builds with their processing state"
+  desc "`latest_testflight_build_number` only reports builds that finished processing,"
+  desc "so right after an upload it looks like nothing arrived. This shows the truth."
+  lane :builds do
+    require_platform!(:ios)
+    recent = testflight_builds(asc_api_key, limit: 10)
+
+    if recent.empty?
+      UI.important("No builds found for #{ios_bundle_id}")
+    else
+      UI.message("Recent builds for #{ios_bundle_id}:")
+      recent.each do |b|
+        UI.message(format("  %-10s build %-5s %-12s %s",
+                          b.app_version, b.version, b.processing_state, b.uploaded_date))
+      end
+    end
+    recent
+  end
+
+  desc "Report what signing material exists locally and in the Apple Developer account"
+  lane :check_signing do
+    require_platform!(:ios)
+    require "spaceship"
+    Spaceship::ConnectAPI.token = Spaceship::ConnectAPI::Token.create(**asc_api_key)
+
+    local = sh("security find-identity -v -p codesigning || true", log: false)
+    local_names = local.scan(/"([^"]+)"/).flatten
+    UI.message("Local codesigning identities:")
+    local_names.each { |n| UI.message("  - #{n}") }
+    UI.message("  (none)") if local_names.empty?
+
+    certs = Spaceship::ConnectAPI::Certificate.all
+    UI.message("Certificates in the Apple Developer account:")
+    certs.each do |c|
+      UI.message("  - #{c.certificate_type}  #{c.display_name.inspect}  expires #{c.expiration_date}")
+    end
+    UI.message("  (none)") if certs.empty?
+
+    dist_local = local_names.any? { |n| n.match?(/Apple Distribution|iPhone Distribution/) }
+    dist_remote = certs.any? { |c| c.certificate_type.to_s.match?(/DISTRIBUTION/) }
+
+    if dist_local
+      UI.success("A distribution identity is present locally — `fastlane ios release` can archive.")
+    elsif dist_remote
+      UI.important(<<~MSG)
+        The account HAS a distribution certificate, but its private key is not in
+        this Mac's keychain — and Apple never re-issues a private key. Either
+        import the original .p12, or create a fresh certificate with
+        `fastlane ios setup_signing` (Apple caps these, so revoke an unused one
+        first if you are at the limit).
+      MSG
+    else
+      UI.important("No distribution certificate exists locally or in the account. Run `fastlane ios setup_signing`.")
+    end
+  end
+
+  desc "Upload the archive's dSYMs to Crashlytics (for symbolicated iOS crash reports)"
+  lane :upload_dsyms do
+    require_platform!(:ios)
+    archive = newest("build/ios/archive/*.xcarchive") or
+      UI.user_error!("No .xcarchive found — run `fastlane ios build_ipa` first")
+
+    gsp = abs("ios/Runner/GoogleService-Info.plist")
+    UI.user_error!("No GoogleService-Info.plist — this app has no Firebase iOS config") unless File.file?(gsp)
+
+    upload_symbols_to_crashlytics(dsym_path: File.join(archive, "dSYMs"), gsp_path: gsp)
+  end
+end
+
+# =============================================================================
+# Per-app configuration
+# =============================================================================
+#
+# Everything app-specific comes from <app>/fastlane/release_kit.yml. Keeping it
+# in data rather than in code is what lets ~10 apps share one Fastfile: fixing a
+# bug here fixes it everywhere, with no per-app edits.
+
+# __dir__ is the kit's fastlane/ directory, so the kit root is one level up.
+KIT_ROOT = File.expand_path("..", __dir__).freeze
+CONFIG_PATH = "fastlane/release_kit.yml".freeze
+
+def config
+  @config ||= begin
+    path = abs(CONFIG_PATH)
+    UI.user_error!(<<~MSG) unless File.file?(path)
+      #{CONFIG_PATH} not found in #{PROJECT_ROOT}.
+
+      This app has not been onboarded to the Flutter Release Kit. Run:
+        #{KIT_ROOT}/bin/frk onboard #{PROJECT_ROOT}
+    MSG
+
+    loaded = YAML.load_file(path) || {}
+    UI.user_error!("#{CONFIG_PATH} is not a YAML mapping") unless loaded.is_a?(Hash)
+    loaded["name"] ||= File.basename(PROJECT_ROOT)
+    loaded
+  end
+end
+
+def platforms
+  @platforms ||= begin
+    list = Array(config["platforms"]).map { |p| p.to_s.strip.downcase }.reject(&:empty?)
+    UI.user_error!("#{CONFIG_PATH}: `platforms` must list at least one of android, ios") if list.empty?
+    unknown = list - %w[android ios]
+    UI.user_error!("#{CONFIG_PATH}: unknown platform(s) #{unknown.join(', ')}") unless unknown.empty?
+    list
+  end
+end
+
+# Conventional `def ... end` throughout: endless method definitions are Ruby
+# 3.0+, and keeping to older syntax means the kit runs on any Ruby fastlane
+# itself supports.
+def android?
+  platforms.include?("android")
+end
+
+def ios?
+  platforms.include?("ios")
+end
+
+# Fail with an explanation rather than a confusing credential error when a lane
+# is run for a platform this app does not ship.
+def require_platform!(platform)
+  return if platforms.include?(platform.to_s)
+
+  UI.user_error!(
+    "#{config['name']} is not configured for #{platform}. " \
+    "Its platforms are: #{platforms.join(', ')}. " \
+    "If that is wrong, edit `platforms` in #{CONFIG_PATH}."
+  )
+end
+
+def platform_config(platform)
+  (config[platform.to_s] || {}).tap do |h|
+    UI.user_error!("#{CONFIG_PATH}: `#{platform}:` section is missing") if h.empty?
+  end
+end
+
+def required_setting(platform, key)
+  value = platform_config(platform)[key].to_s.strip
+  UI.user_error!("#{CONFIG_PATH}: `#{platform}.#{key}` is required") if value.empty?
+  value
+end
+
+def android_package
+  required_setting(:android, "package_name")
+end
+
+def ios_bundle_id
+  required_setting(:ios, "bundle_id")
+end
+
+def ios_team_id
+  required_setting(:ios, "team_id")
+end
+
+# Testing tracks only. `production` is rejected at upload time as well.
+def android_track
+  track = (platform_config(:android)["track"] || "internal").to_s.strip
+  allowed = %w[internal alpha beta]
+  UI.user_error!("#{CONFIG_PATH}: android.track must be one of #{allowed.join(', ')} (got '#{track}')") unless allowed.include?(track)
+  track
+end
+
+def obfuscate?
+  config.fetch("obfuscate", true) ? true : false
+end
+
+# How long one TestFlight upload attempt may run before it is cancelled and
+# retried. Default 8 minutes: observed healthy uploads typically finish in
+# 100-200 seconds, while stalls run 45+ minutes, so 8 is several times the normal
+# case yet still catches a hang quickly.
+def ios_upload_timeout_minutes
+  value = ENV["IOS_UPLOAD_TIMEOUT_MINUTES"] || platform_config(:ios)["upload_timeout_minutes"] || 8
+  minutes = value.to_i
+  UI.user_error!("upload_timeout_minutes must be a positive integer (got #{value})") if minutes < 1
+  minutes
+end
+
+# Total attempts, including the first. Default 3 — stalls are random and normally
+# clear on the second or third try.
+def ios_upload_attempts
+  value = ENV["IOS_UPLOAD_ATTEMPTS"] || platform_config(:ios)["upload_attempts"] || 3
+  attempts = value.to_i
+  UI.user_error!("upload_attempts must be a positive integer (got #{value})") if attempts < 1
+  attempts
+end
+
+def firebase_android_app_id
+  (platform_config(:android)["firebase_app_id"] || "").to_s.strip
+end
+
+# Where setup_signing writes certificates/profiles. Signing material belongs in
+# the private machine vault, not in any app repository. The distribution
+# certificate is team-level; provisioning profiles inside this folder remain
+# app-specific by filename.
+def signing_output_dir
+  dir = File.join(SHARED_CREDENTIALS_DIR, "signing", "ios", ios_team_id)
+  FileUtils.mkdir_p(dir)
+  File.chmod(0o700, dir)
+  dir
+end
+
+def ios_profile_name
+  "#{ios_bundle_id} AppStore"
+end
+
+def ios_profile_filename
+  "AppStore_#{ios_bundle_id}.mobileprovision"
+end
+
+def ios_profile_path
+  File.join(signing_output_dir, ios_profile_filename)
+end
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+def truthy?(value)
+  %w[true 1 yes y].include?(value.to_s.strip.downcase)
+end
+
+def abs(relative)
+  File.expand_path(relative, PROJECT_ROOT)
+end
+
+# Newest file matching an app-relative glob, or nil.
+def newest(glob)
+  Dir.glob(File.join(PROJECT_ROOT, glob)).max_by { |f| File.mtime(f) }
+end
+
+def flutter(args)
+  sh("cd #{PROJECT_ROOT.shellescape} && #{FLUTTER_BIN.shellescape} #{args}")
+end
+
+# --build-name / --build-number, from lane options then env. Unset means "use
+# the version in pubspec.yaml". Nothing is auto-incremented because an app may
+# keep separate version streams per store, so guessing would be wrong.
+def version_args(options, env_prefix)
+  name   = options[:build_name]   || ENV["#{env_prefix}_BUILD_NAME"]
+  number = options[:build_number] || ENV["#{env_prefix}_BUILD_NUMBER"]
+
+  fallback_name, fallback_number = pubspec_version.split("+", 2)
+  effective_name = name.to_s.strip.empty? ? fallback_name.to_s.strip : name.to_s.strip
+  effective_number = number.to_s.strip.empty? ? fallback_number.to_s.strip : number.to_s.strip
+  UI.user_error!("Build name cannot be empty or contain whitespace") if effective_name.empty? || effective_name.match?(/\s/)
+  unless effective_number.match?(/\A[1-9]\d*\z/) && effective_number.to_i <= 2_100_000_000
+    UI.user_error!("Build number must be an integer between 1 and 2100000000 (got '#{effective_number}')")
+  end
+
+  args = []
+  args << "--build-name=#{name.to_s.strip.shellescape}" unless name.to_s.strip.empty?
+  args << "--build-number=#{number.to_s.strip.shellescape}" unless number.to_s.strip.empty?
+
+  if args.empty?
+    UI.message("Version: pubspec.yaml (#{pubspec_version})")
+  else
+    UI.message("Version override: #{args.join(' ')}")
+  end
+  args
+end
+
+def reject_version_override_with_skip_build!(options, env_prefix)
+  return unless truthy?(options[:skip_build])
+
+  overridden = options[:build_name] || options[:build_number] ||
+               ENV["#{env_prefix}_BUILD_NAME"] || ENV["#{env_prefix}_BUILD_NUMBER"]
+  return if overridden.to_s.strip.empty?
+
+  UI.user_error!(
+    "Do not combine skip_build:true with version overrides; the existing " \
+    "artifact may contain a different version."
+  )
+end
+
+def pubspec_version
+  File.read(abs("pubspec.yaml"))[/^version:\s*(\S+)/, 1].to_s
+end
+
+# --- shared credentials -------------------------------------------------------
+
+# Account-level credentials are shared by every app, so they live once in
+# ~/.flutter-release/credentials.env rather than being copied into each repo.
+# An app's own fastlane/.env (already loaded by fastlane's dotenv) wins, so a
+# single app can point at a different developer account.
+def load_shared_credentials!
+  return if @shared_credentials_loaded
+
+  @shared_credentials_loaded = true
+  path = File.join(SHARED_CREDENTIALS_DIR, "credentials.env")
+  unless File.file?(path)
+    UI.verbose("no shared credentials at #{path}")
+    return
+  end
+
+  File.readlines(path).each do |line|
+    line = line.strip
+    next if line.empty? || line.start_with?("#")
+
+    key, _, value = line.partition("=")
+    key = key.strip
+    value = value.strip.gsub(/\A["']|["']\z/, "")
+    next if key.empty?
+
+    # Never clobber something the app or the shell already set.
+    ENV[key] = value unless ENV.key?(key) && !ENV[key].to_s.strip.empty?
+  end
+  UI.verbose("loaded shared credentials from #{path}")
+end
+
+# Resolve a credential path that may be relative to the app, to the shared
+# credentials dir, or absolute.
+def resolve_credential_path(value)
+  return nil if value.to_s.strip.empty?
+
+  raw = File.expand_path(value.to_s.strip)
+  return raw if File.file?(raw)
+
+  [PROJECT_ROOT, SHARED_CREDENTIALS_DIR].each do |base|
+    candidate = File.expand_path(value.to_s.strip, base)
+    return candidate if File.file?(candidate)
+  end
+  nil
+end
+
+# --- Android credentials ------------------------------------------------------
+
+def play_store_json_key
+  load_shared_credentials!
+
+  # An app may name its own key (different developer account); otherwise the
+  # shared default is used.
+  configured = platform_config(:android)["play_json_key"].to_s.strip
+  configured = ENV["SUPPLY_JSON_KEY"].to_s.strip if configured.empty?
+
+  unless configured.empty?
+    path = resolve_credential_path(configured)
+    UI.user_error!(<<~MSG) if path.nil?
+      Google Play service account key not found: #{configured}
+
+      Looked in the app root (#{PROJECT_ROOT}) and #{SHARED_CREDENTIALS_DIR}.
+    MSG
+    return path
+  end
+
+  found = Dir.glob([
+    File.join(SHARED_CREDENTIALS_DIR, "play", "*.json"),
+    File.join(PROJECT_ROOT, "key", "*.json")
+  ]).select do |f|
+    begin
+      JSON.parse(File.read(f))["type"] == "service_account"
+    rescue StandardError
+      false
+    end
+  end
+  return found.first if found.one?
+  if found.length > 1
+    UI.user_error!(<<~MSG)
+      More than one Google Play service-account key was found:
+        #{found.join("\n  ")}
+
+      Select one explicitly with SUPPLY_JSON_KEY in
+      #{File.join(SHARED_CREDENTIALS_DIR, 'credentials.env')}, or set
+      android.play_json_key for this app in #{CONFIG_PATH}.
+    MSG
+  end
+
+  UI.user_error!(<<~MSG)
+    No Google Play service account key found.
+
+    Put the JSON key in #{File.join(SHARED_CREDENTIALS_DIR, 'play')} and set
+    SUPPLY_JSON_KEY in #{File.join(SHARED_CREDENTIALS_DIR, 'credentials.env')}.
+
+    Create one at Google Cloud Console > IAM & Admin > Service Accounts > Keys,
+    enable the Google Play Android Developer API for that project, then grant it
+    access to #{android_package} in Play Console > Users and permissions.
+  MSG
+end
+
+# Ask Play what it already knows about this app.
+#
+# Deliberately not fastlane's `google_play_track_version_codes`: that calls
+# `result.releases.flat_map(...)`, and a track that exists but holds no releases
+# comes back as HTTP 200 with `releases` nil, so the action dies with
+# `undefined method 'flat_map' for nil` — indistinguishable, from the outside,
+# from a real permissions failure (supply/lib/supply/client.rb:501; its rescue
+# only covers the 404 "track not found" case).
+#
+# Returns { ok: true, internal_codes: [...], uploaded_codes: [...] }
+#      or { ok: false, denied: bool, message: String }. Never raises.
+def play_status(json_key)
+  require "google/apis/androidpublisher_v3"
+  require "googleauth"
+
+  package = android_package
+  track = android_track
+
+  service = Google::Apis::AndroidpublisherV3::AndroidPublisherService.new
+  service.authorization = Google::Auth::ServiceAccountCredentials.make_creds(
+    json_key_io: File.open(json_key),
+    scope: [Google::Apis::AndroidpublisherV3::AUTH_ANDROIDPUBLISHER]
+  )
+
+  edit = service.insert_edit(package)
+  begin
+    on_track = service.get_edit_track(package, edit.id, track)
+    bundles  = service.list_edit_bundles(package, edit.id)
+    {
+      ok: true,
+      internal_codes: (on_track.releases || []).flat_map { |r| r.version_codes || [] }.map(&:to_i).sort,
+      uploaded_codes: (bundles.bundles || []).map { |b| b.version_code.to_i }.sort
+    }
+  ensure
+    # Read-only probe: throw the edit away rather than leaving it open.
+    begin
+      service.delete_edit(package, edit.id)
+    rescue StandardError => e
+      UI.verbose("could not delete probe edit: #{e.message}")
+    end
+  end
+rescue Google::Apis::ClientError => e
+  {
+    ok: false,
+    denied: [401, 403].include?(e.status_code),
+    # 404 means Play will not admit the package exists — either it was never
+    # created in the Console, or this service account cannot see it. Google
+    # answers both the same way on purpose, so the two are not separable here.
+    missing: e.status_code == 404,
+    status_code: e.status_code,
+    message: play_error_message(e)
+  }
+rescue StandardError => e
+  { ok: false, denied: false, missing: false, status_code: nil, message: e.message }
+end
+
+# `Google::Apis::ClientError#message` is a generic label — every 4xx from the
+# Publishing API reads "Invalid request". The sentence that identifies the
+# actual problem ("Package not found: com.example.app") is only in the JSON
+# body, so a caller shown just the message cannot tell a missing app from a
+# permissions failure.
+def play_error_message(error)
+  detail = JSON.parse(error.body.to_s).dig("error", "message").to_s.strip
+  detail.empty? ? error.message : detail
+rescue StandardError
+  error.message
+end
+
+# Play requires a version code to be unused app-wide, so an empty testing track
+# proves nothing — check against every bundle ever uploaded. An app can keep an
+# Android version stream well ahead of pubspec.yaml, which makes a
+# silent duplicate very easy to produce.
+def warn_if_version_code_not_higher(options, json_key)
+  local = (options[:build_number] || ENV["ANDROID_BUILD_NUMBER"] || pubspec_version.split("+").last).to_s.strip
+  return unless local.match?(/\A\d+\z/)
+
+  status = play_status(json_key)
+  unless status[:ok]
+    UI.important("Could not read Play version codes — skipping the version-code check (#{status[:message].to_s.lines.first.to_s.strip})")
+    return
+  end
+
+  used = status[:uploaded_codes]
+  return if used.empty?
+
+  highest = used.max
+  return if local.to_i > highest
+
+  conflict = used.include?(local.to_i) ? "is already uploaded" : "is not higher than #{highest}, already uploaded"
+  UI.user_error!(<<~MSG)
+    versionCode #{local} #{conflict}. Play will reject this bundle.
+
+    Pass the next one explicitly, e.g.
+      fastlane android release build_number:#{highest + 1}
+    or set ANDROID_BUILD_NUMBER in fastlane/.env.
+  MSG
+end
+
+def service_account_email(json_key)
+  JSON.parse(File.read(json_key))["client_email"].to_s
+rescue StandardError
+  "<the client_email in the JSON key>"
+end
+
+def preflight_android_signing
+  props = abs("android/key.properties")
+  UI.user_error!(<<~MSG) unless File.file?(props)
+    android/key.properties is missing — the release build would be signed with
+    the debug key and Play would reject it. Create it with storePassword,
+    keyPassword, keyAlias and storeFile pointing at this app's upload keystore.
+  MSG
+
+  content = File.read(props)
+  required = %w[storeFile storePassword keyAlias keyPassword]
+  missing = required.reject { |key| content[/^\s*#{Regexp.escape(key)}\s*=\s*(.+)$/, 1].to_s.strip.length.positive? }
+  UI.user_error!("android/key.properties is incomplete: #{missing.join(', ')}") unless missing.empty?
+
+  store = content[/^\s*storeFile\s*=\s*(.+)$/, 1].to_s.strip
+  UI.user_error!("android/key.properties has no storeFile entry") if store.empty?
+
+  store_path = if Pathname.new(store).absolute?
+                 File.expand_path(store)
+               else
+                 # Gradle's file(...) resolves from android/app, while the less
+                 # common rootProject.file(...) resolves from android/. Match
+                 # the app's build script so preflight and Gradle inspect the
+                 # same file.
+                 gradle = [abs("android/app/build.gradle.kts"), abs("android/app/build.gradle")]
+                          .select { |path| File.file?(path) }
+                          .map { |path| File.read(path) }
+                          .join("\n")
+                 base = gradle.match?(/storeFile[^\n]{0,200}rootProject\.file/) ? abs("android") : abs("android/app")
+                 File.expand_path(store, base)
+               end
+  UI.user_error!("Keystore referenced by android/key.properties not found: #{store_path}") unless File.file?(store_path)
+end
+
+def upload_crashlytics_symbols
+  app_id = firebase_android_app_id
+  if app_id.empty?
+    UI.important("No android.firebase_app_id in #{CONFIG_PATH} — skipping Crashlytics symbol upload")
+    return
+  end
+  unless sh("command -v firebase >/dev/null 2>&1 && echo yes || echo no", log: false).strip == "yes"
+    UI.important("Firebase CLI not installed — skipping Crashlytics symbol upload")
+    return
+  end
+  sh("cd #{PROJECT_ROOT.shellescape} && firebase crashlytics:symbols:upload " \
+     "--app=#{app_id.shellescape} #{SYMBOLS_DIR}")
+end
+
+# --- iOS credentials ----------------------------------------------------------
+
+def asc_key_parts
+  load_shared_credentials!
+
+  key_id    = ENV["ASC_KEY_ID"].to_s.strip
+  issuer_id = ENV["ASC_ISSUER_ID"].to_s.strip
+  content   = ENV["ASC_KEY_CONTENT"].to_s.strip
+  filepath  = ENV["ASC_KEY_FILEPATH"].to_s.strip
+
+  filepath = resolve_credential_path(filepath).to_s unless filepath.empty?
+
+  # Fall back to the conventional locations for a downloaded .p8.
+  if filepath.empty? && content.empty?
+    candidates = Dir.glob([
+      File.join(SHARED_CREDENTIALS_DIR, "asc", "AuthKey_*.p8"),
+      File.join(PROJECT_ROOT, "key", "AuthKey_*.p8"),
+      File.expand_path("~/.appstoreconnect/private_keys/AuthKey_*.p8"),
+      File.expand_path("~/private_keys/AuthKey_*.p8")
+    ])
+    candidates.select! { |path| File.basename(path) == "AuthKey_#{key_id}.p8" } unless key_id.empty?
+    if candidates.length > 1
+      UI.user_error!(
+        "Multiple App Store Connect keys were found. Set ASC_KEY_ID and " \
+        "ASC_KEY_FILEPATH explicitly in #{File.join(SHARED_CREDENTIALS_DIR, 'credentials.env')}."
+      )
+    end
+    filepath = candidates.first.to_s
+  end
+
+  # The key id is embedded in the standard Apple filename.
+  key_id = File.basename(filepath, ".p8").sub("AuthKey_", "") if key_id.empty? && !filepath.empty?
+
+  if (filepath.empty? && content.empty?) || key_id.empty? || issuer_id.empty?
+    UI.user_error!(<<~MSG)
+      App Store Connect API key is not configured.
+
+      This is an ACCOUNT-level credential shared by every app on the team, so it
+      belongs in #{SHARED_CREDENTIALS_DIR}, not in an app repo.
+
+      Create one at App Store Connect > Users and Access > Integrations >
+      App Store Connect API (role: App Manager), download the .p8 once, then put
+      in #{File.join(SHARED_CREDENTIALS_DIR, 'credentials.env')}:
+        ASC_KEY_ID=<10-char Key ID>
+        ASC_ISSUER_ID=<Issuer ID (UUID) shown above the key list>
+        ASC_KEY_FILEPATH=asc/AuthKey_<KEYID>.p8
+    MSG
+  end
+
+  unless filepath.empty? || File.file?(filepath)
+    UI.user_error!("ASC_KEY_FILEPATH points at a file that does not exist: #{filepath}")
+  end
+
+  { key_id: key_id, issuer_id: issuer_id, filepath: filepath, content: content }
+end
+
+def asc_api_key
+  parts = asc_key_parts
+  app_store_connect_api_key(
+    key_id: parts[:key_id],
+    issuer_id: parts[:issuer_id],
+    key_filepath: parts[:content].empty? ? parts[:filepath] : nil,
+    key_content: parts[:content].empty? ? nil : parts[:content],
+    is_key_content_base64: !parts[:content].empty? && !parts[:content].include?("BEGIN PRIVATE KEY"),
+    in_house: false
+  )
+end
+
+def ios_version(options)
+  name   = (options[:build_name] || ENV["IOS_BUILD_NAME"] || pubspec_version.split("+").first).to_s.strip
+  number = (options[:build_number] || ENV["IOS_BUILD_NUMBER"] || pubspec_version.split("+").last).to_s.strip
+  [name, number]
+end
+
+# The version actually baked into an .ipa — which is NOT always the one that was
+# requested. Xcode has been observed bumping CFBundleVersion during export even
+# with manageAppVersionAndBuildNumber=false (asked for build 6, shipped build 7).
+# Verifying an upload against the requested number therefore reports a false
+# failure, so always confirm against what the artifact really contains.
+def ipa_version(ipa_path)
+  require "tmpdir"
+  Dir.mktmpdir do |dir|
+    ok = system("unzip", "-qo", ipa_path, "Payload/*.app/Info.plist", "-d", dir,
+                out: File::NULL, err: File::NULL)
+    return nil unless ok
+
+    plist = Dir.glob(File.join(dir, "Payload", "*.app", "Info.plist")).first
+    return nil if plist.nil?
+
+    short = `/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" #{plist.shellescape}`.strip
+    build = `/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" #{plist.shellescape}`.strip
+    return nil if short.empty? || build.empty?
+
+    [short, build]
+  end
+rescue StandardError => e
+  UI.verbose("could not read version from #{ipa_path}: #{e.message}")
+  nil
+end
+
+# Every recent build for THIS app, newest first, including ones still processing.
+#
+# Deliberately not `latest_testflight_build_number`: it only counts builds that
+# have finished processing, and with no `version:` it reports whichever version
+# train it considers latest. Straight after an upload that combination reports
+# the *previous* build — which reads as "the upload failed" when it did not.
+def testflight_builds(api_key, limit: 50)
+  require "spaceship"
+  Spaceship::ConnectAPI.token = Spaceship::ConnectAPI::Token.create(**api_key)
+  app = Spaceship::ConnectAPI::App.find(ios_bundle_id)
+  UI.user_error!(<<~MSG) if app.nil?
+    #{ios_bundle_id} does not exist on App Store Connect for this API key.
+
+    Check `ios.bundle_id` in #{CONFIG_PATH} against the app record in App Store
+    Connect — the iOS bundle id often differs from the Android package name.
+  MSG
+  Spaceship::ConnectAPI::Build.all(app_id: app.id, sort: "-uploadedDate", limit: limit)
+end
+
+# Is this exact version/build pair on TestFlight? Sees PROCESSING builds, so it
+# resolves within seconds of an upload rather than after processing completes.
+def testflight_has_build?(api_key, version, number, attempts: 10, delay: 30)
+  attempts.times do |i|
+    found = testflight_builds(api_key).any? do |b|
+      b.app_version.to_s == version.to_s && b.version.to_s == number.to_s
+    end
+    return true if found
+
+    if i < attempts - 1
+      UI.message("Build #{version} (#{number}) not visible yet; re-checking in #{delay}s")
+      sleep(delay)
+    end
+  end
+  false
+rescue StandardError => e
+  UI.important("Could not query TestFlight: #{e.message}")
+  false
+end
+
+# Apple's Transporter stalls at random. A given IPA may upload in 100 seconds on
+# one attempt and hang for hours on the next, and the same thing happens when
+# uploading straight from Xcode — so it is Apple's transport, not this setup.
+# Cancelling and retrying reliably clears it, usually within two or three tries.
+#
+# That makes waiting the wrong strategy: cap each attempt, kill the transfer, and
+# start over. A killed multipart upload is discarded server-side, so retrying is
+# safe. Between attempts we still ask App Store Connect whether the build landed,
+# because a stall can happen *after* the bytes arrived.
+def upload_to_testflight_with_retry(api_key:, ipa:, version:, number:, wait:, changelog:)
+  attempts  = ios_upload_attempts
+  timeout_s = ios_upload_timeout_minutes * 60
+
+  attempts.times do |i|
+    attempt = i + 1
+    UI.message("TestFlight upload attempt #{attempt}/#{attempts} " \
+               "(cancelling after #{ios_upload_timeout_minutes} min if it stalls)")
+
+    started = Time.now
+    timed_out = false
+
+    # The upload MUST run on the main thread: fastlane's action runner calls
+    # Dir.chdir, and Ruby raises "conflicting chdir during another chdir block"
+    # if two threads do that at once. So the watchdog is the thread instead — it
+    # only sleeps and then kills the transfer, which makes the blocking upload on
+    # the main thread fail fast and fall into the retry path below.
+    watchdog = Thread.new do
+      sleep(timeout_s)
+      timed_out = true
+      UI.important("Attempt #{attempt} exceeded #{ios_upload_timeout_minutes} min — cancelling the transfer")
+      kill_transporter!
+    end
+
+    begin
+      upload_to_testflight(
+        api_key: api_key,
+        app_identifier: ios_bundle_id,
+        ipa: ipa,
+        skip_submission: true,
+        skip_waiting_for_build_processing: !wait,
+        changelog: wait ? changelog : nil,
+        distribute_external: false
+      )
+      watchdog.kill
+      UI.success("Uploaded #{version} (#{number}) to TestFlight in #{(Time.now - started).round}s")
+      return
+    rescue StandardError => e
+      watchdog.kill
+      elapsed = (Time.now - started).round
+
+      if timed_out
+        # The stall may have come after the bytes were already delivered.
+        if testflight_has_build?(api_key, version, number, attempts: 2, delay: 20)
+          UI.success("#{version} (#{number}) reached TestFlight despite the stall")
+          return
+        end
+      else
+        # A validation rejection is final — App Store Connect refused the binary.
+        # Retrying or polling would only waste time.
+        if (rejection = validation_rejection(e.message))
+          UI.user_error!(rejection)
+        end
+
+        # Transporter retries chunks internally and can deliver the build while
+        # still surfacing those retries as a fatal error (classic case:
+        # NSURLErrorDomain -1005 "network connection was lost"). Ask App Store
+        # Connect what actually happened before calling this attempt a failure.
+        # Wait generously here. The two outcomes are not symmetric:
+        #   - concluding "failed" too early re-uploads a build that already
+        #     landed, which Apple rejects as a duplicate — confusing and slow;
+        #   - waiting longer only costs time when the upload really did fail.
+        #
+        # In an observed upload, altool logged "UPLOAD SUCCEEDED", fastlane raised
+        # anyway, and the build took 465 seconds (7m45s) to become visible through
+        # the API. A 60-second check missed it and began a needless third attempt.
+        # So the window is 10 minutes — comfortably past the worst lag observed,
+        # because a false negative is the expensive mistake here.
+        UI.important("Attempt #{attempt} failed after #{elapsed}s: #{e.message.lines.first.to_s.strip}")
+        UI.message("Transporter often delivers the build despite this error, and " \
+                   "App Store Connect can take ~8 minutes to show it — waiting")
+        if testflight_has_build?(api_key, version, number, attempts: 20, delay: 30)
+          UI.success("#{version} (#{number}) is on TestFlight — the error was transport noise")
+          return
+        end
+      end
+    ensure
+      watchdog.kill if watchdog.alive?
+    end
+
+    UI.important("Retrying — Apple's transport stalls at random and usually " \
+                 "succeeds on a later attempt") if attempt < attempts
+  end
+
+  UI.user_error!(<<~MSG)
+    #{version} (#{number}) did not reach TestFlight after #{attempts} attempts,
+    each capped at #{ios_upload_timeout_minutes} minutes.
+
+    Apple's Transporter stalling is usually transient, so this many failures in a
+    row suggests something else. Check your connection, then:
+      fastlane ios builds                 # confirm it really is not there
+      fastlane ios validate               # run Apple's static validation
+      fastlane ios upload_only            # retry without rebuilding
+
+    To let a slow-but-working upload run longer, raise the cap:
+      IOS_UPLOAD_TIMEOUT_MINUTES=25 fastlane ios upload_only
+  MSG
+end
+
+# Stop an in-flight upload. altool drives a Java iTMSTransporter child, and
+# killing the Ruby thread alone would leave it running and holding the network.
+def kill_transporter!
+  # -x matches the exact process name so this cannot match a grep of our own.
+  sh("pkill -x altool 2>/dev/null || true", log: false)
+  sh("pkill -f iTMSTransporter 2>/dev/null || true", log: false)
+  sleep(5)
+  still = sh("pgrep -x altool >/dev/null 2>&1 && echo yes || echo no", log: false).strip
+  UI.important("altool did not exit after SIGTERM; sending SIGKILL") if still == "yes"
+  sh("pkill -9 -x altool 2>/dev/null || true", log: false) if still == "yes"
+end
+
+# Apple closes a "pre-release train" once a version has been through review, and
+# refuses further TestFlight builds for it with a 409. That is not something the
+# build-number check can see: a version can have a single TestFlight build and
+# still be closed. Recognising the rejection text is what turns a five-minute
+# confusing failure into a one-line instruction.
+def validation_rejection(message)
+  text = message.to_s
+
+  if text.include?("Invalid Pre-Release Train") || text.include?("closed for new build submissions")
+    version = text[/train version '([^']+)'/, 1] || "this version"
+    return <<~MSG
+      App Store Connect rejected the build: the version train #{version} is CLOSED.
+
+      Apple closes a version train once it has been through review, and then
+      refuses any further TestFlight build for it — regardless of build number.
+      A higher build number will NOT help.
+
+      Raise the marketing version instead:
+        fastlane ios release build_name:<higher than #{version}> build_number:1
+
+      See which versions exist: `fastlane ios builds`.
+    MSG
+  end
+
+  if text.include?("must contain a higher version than that of the previously approved version")
+    approved = text[/previously approved version \[([^\]]+)\]/, 1] || "the released version"
+    return <<~MSG
+      App Store Connect rejected the build: CFBundleShortVersionString must be
+      higher than the already-approved version #{approved}.
+
+      Raise the marketing version:
+        fastlane ios release build_name:<higher than #{approved}> build_number:1
+    MSG
+  end
+
+  nil
+end
+
+# Marketing versions that already reached the App Store. Building one of these
+# again is rejected, so it is worth knowing before an archive.
+def appstore_released_versions(api_key)
+  require "spaceship"
+  Spaceship::ConnectAPI.token = Spaceship::ConnectAPI::Token.create(**api_key)
+  app = Spaceship::ConnectAPI::App.find(ios_bundle_id)
+  return [] if app.nil?
+
+  terminal = %w[READY_FOR_SALE APPROVED PENDING_DEVELOPER_RELEASE REPLACED_WITH_NEW_INFO]
+  app.get_app_store_versions(limit: 50)
+     .select { |v| terminal.include?(v.app_store_state.to_s) }
+     .map { |v| v.version_string.to_s }
+rescue StandardError => e
+  UI.verbose("could not read App Store versions: #{e.message}")
+  []
+end
+
+def warn_if_testflight_build_taken(options, api_key)
+  name, number = ios_version(options)
+  return unless number.match?(/\A\d+\z/)
+
+  if appstore_released_versions(api_key).include?(name)
+    UI.user_error!(<<~MSG)
+      Version #{name} is already released on the App Store, so its version train
+      is closed and TestFlight will reject any build for it.
+
+      Raise the marketing version:
+        fastlane ios release build_name:<higher than #{name}> build_number:1
+    MSG
+  end
+
+  begin
+    same_version = testflight_builds(api_key).select { |b| b.app_version.to_s == name }
+  rescue FastlaneCore::Interface::FastlaneError
+    raise
+  rescue StandardError => e
+    UI.important("Could not read TestFlight builds — skipping that check (#{e.message})")
+    return
+  end
+
+  return if same_version.empty?
+
+  latest = same_version.map { |b| b.version.to_i }.max
+  return if number.to_i > latest
+
+  UI.user_error!(<<~MSG)
+    TestFlight already has build #{latest} for version #{name}, so build
+    #{number} will be rejected.
+
+    Pass the next one explicitly, e.g.
+      fastlane ios release build_name:#{name} build_number:#{latest + 1}
+    or bump the version in pubspec.yaml / set IOS_BUILD_NUMBER in fastlane/.env.
+  MSG
+end
+
+# `flutter build ipa` signs with Xcode's automatic signing. That needs a
+# distribution identity in the login keychain; without one the archive fails
+# deep inside xcodebuild with an unhelpful error, so check up front.
+def preflight_ios_signing
+  identities = sh("security find-identity -v -p codesigning || true", log: false)
+  unless identities.match?(/Apple Distribution|iPhone Distribution/)
+    UI.user_error!(<<~MSG)
+      No Apple Distribution signing identity in the login keychain
+      (found only: #{identities.scan(/"([^"]+)"/).flatten.join(', ')}).
+
+      The certificate is account-level, so creating it once covers every app on
+      team #{ios_team_id}:
+        fastlane ios setup_signing
+
+      Alternatively import an existing distribution .p12 into the login keychain,
+      or add the account in Xcode > Settings > Accounts > Manage Certificates.
+    MSG
+  end
+
+  return if File.file?(ios_profile_path)
+
+  UI.user_error!(<<~MSG)
+    The Release Kit provisioning profile for #{ios_bundle_id} is missing:
+      #{ios_profile_path}
+
+    Create or refresh the app-specific profile before building:
+      fastlane ios setup_signing
+  MSG
+end
+
+# `flutter build ipa` needs an ExportOptions.plist. It is derived entirely from
+# release_kit.yml, so generate it rather than making every repo hand-maintain a
+# copy — and keep the two settings that matter correct:
+#   destination = export  (otherwise xcodebuild uploads during export and
+#                          leaves no .ipa for upload_to_testflight)
+#   manageAppVersionAndBuildNumber = false (keep Flutter's version numbers)
+def ensure_export_options!
+  path = abs(EXPORT_OPTIONS)
+  return if File.file?(path)
+
+  UI.important("#{EXPORT_OPTIONS} missing — generating it for team #{ios_team_id}")
+  File.write(path, export_options_plist(ios_team_id, ios_bundle_id))
+end
+
+def export_options_plist(team_id, bundle_id)
+  <<~PLIST
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>
+        <key>method</key>
+        <string>app-store-connect</string>
+        <key>teamID</key>
+        <string>#{team_id}</string>
+        <!-- `ios setup_signing` creates this deterministic profile name.
+             Pinning it prevents Xcode from silently selecting a stale
+             automatic profile for another distribution certificate. -->
+        <key>signingStyle</key>
+        <string>manual</string>
+        <key>signingCertificate</key>
+        <string>Apple Distribution</string>
+        <key>provisioningProfiles</key>
+        <dict>
+            <key>#{bundle_id}</key>
+            <string>#{bundle_id} AppStore</string>
+        </dict>
+        <key>uploadSymbols</key>
+        <true/>
+        <!-- `export` writes a local .ipa that Fastlane then uploads. Do NOT set
+             this to `upload`: xcodebuild would push the build itself during
+             export, leaving no .ipa on disk for upload_to_testflight. -->
+        <key>destination</key>
+        <string>export</string>
+        <!-- Keep the version/build numbers Flutter baked in. -->
+        <key>manageAppVersionAndBuildNumber</key>
+        <false/>
+    </dict>
+    </plist>
+  PLIST
+end
