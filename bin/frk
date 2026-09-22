@@ -744,6 +744,29 @@ def is_registered(app: Path) -> bool:
     )
 
 
+def find_managed_project(value: str) -> dict | None:
+    """Resolve registered paths first, then unique saved/current project names."""
+    requested = Path(value).expanduser()
+    requested_path = requested.resolve()
+    projects = managed_projects()
+    for entry in projects:
+        if Path(entry["path"]).expanduser().resolve() == requested_path:
+            return entry
+    # An existing path means that directory, even if another registered app
+    # shares its basename. Match the human CLI's path precedence in the API.
+    if requested.exists():
+        return None
+    matches = []
+    for entry in projects:
+        app = Path(entry["path"]).expanduser()
+        current_name = config_summary(app)[0] if (app / CONFIG_NAME).is_file() else None
+        if value in (entry.get("name"), current_name):
+            matches.append(entry)
+    if len(matches) > 1:
+        die(f"more than one managed app is named '{value}'; use its full path")
+    return matches[0] if matches else None
+
+
 def resolve_app(value: str | None) -> Path:
     """Resolve a path or a unique managed-project name; default to cwd."""
     raw = value or "."
@@ -751,20 +774,9 @@ def resolve_app(value: str | None) -> Path:
     if path.exists():
         return path.resolve()
 
-    projects = managed_projects()
-    requested_path = path.resolve()
-    path_matches = [
-        p for p in projects
-        if Path(p.get("path", "")).expanduser().resolve() == requested_path
-    ]
-    if len(path_matches) == 1:
-        return requested_path
-
-    matches = [p for p in projects if p.get("name") == raw]
-    if len(matches) == 1:
-        return Path(matches[0]["path"]).expanduser().resolve()
-    if len(matches) > 1:
-        die(f"more than one managed app is named '{raw}'; use its full path")
+    entry = find_managed_project(raw)
+    if entry is not None:
+        return Path(entry["path"]).expanduser().resolve()
     die(f"no path or managed app named '{raw}'")
 
 
@@ -1266,7 +1278,18 @@ def run_fastlane(
     command = fastlane_command(lane, options, prevent_sleep=prevent_sleep)
     head(f"{app.name}: {' '.join(command)}")
     sys.stdout.flush()
-    return subprocess.call(command, cwd=app, env=fastlane_env())
+    if (os.environ.get("_FRK_API_PARENT_PID") == str(os.getppid())
+            and os.getpgrp() == os.getpid()):
+        # `api run` owns this child's entire group. Keep Fastlane in that group
+        # so the parent's bounded cleanup also reaches stubborn grandchildren.
+        code = subprocess.call(command, cwd=app, env=fastlane_env())
+    else:
+        try:
+            with managed_child(command, cwd=app, env=fastlane_env()) as process:
+                code = process.wait()
+        except ProcessCancelled as exc:
+            return exc.exit_code
+    return 128 + abs(code) if code < 0 else code
 
 
 def signal_process_group(process, number: int) -> None:
@@ -2467,13 +2490,7 @@ def store_versions_marker_payload(output: str) -> str | None:
 # api subcommands
 # --------------------------------------------------------------------------- #
 def api_find_project(value: str) -> dict | None:
-    requested = Path(value).expanduser()
-    requested_path = requested.resolve() if requested.exists() else None
-    for entry in managed_projects():
-        entry_path = Path(entry.get("path", "")).expanduser().resolve()
-        if entry.get("name") == value or (requested_path and entry_path == requested_path):
-            return entry
-    return None
+    return find_managed_project(value)
 
 
 def cmd_api_capabilities(args) -> int:
@@ -2721,17 +2738,26 @@ def api_action_command(args) -> list[str]:
     action = args.action
     app = args.app_dir
 
+    if args.dry_run and action != "onboard":
+        raise ValueError(
+            f"--dry-run is not supported for action '{action}'; no action was started. "
+            "Use 'validate --platform android' for Google Play validation."
+        )
+
     if action == "status":
         return [*frk, "status"]
+    app = require_api_value(app, "project path" if action == "onboard" else "project")
+    # The project is data, including names beginning with '-'. Place it after
+    # all options and `--` so it cannot enable a flag or select the default cwd.
     if action == "forget":
-        return [*frk, "forget", require_api_value(app, "project")]
+        return [*frk, "forget", "--", app]
     if action in ("doctor", "verify"):
-        return [*frk, action, require_api_value(app, "project")]
+        return [*frk, action, "--", app]
     if action in ("signing-audit", "signing-link"):
         signing_action = action.removeprefix("signing-")
-        return [*frk, "signing", signing_action, require_api_value(app, "project")]
+        return [*frk, "signing", signing_action, "--", app]
     if action == "signing-import":
-        command = [*frk, "signing", "import", require_api_value(app, "project")]
+        command = [*frk, "signing", "import"]
         if args.properties:
             command += ["--properties", args.properties]
         if args.keystore:
@@ -2740,11 +2766,11 @@ def api_action_command(args) -> list[str]:
             command.append("--force")
         if args.link:
             command.append("--link")
-        return command
+        return [*command, "--", app]
     if action == "ios-setup-signing":
-        return [*frk, "signing", "ios-setup", require_api_value(app, "project")]
+        return [*frk, "signing", "ios-setup", "--", app]
     if action == "onboard":
-        command = [*frk, "onboard", require_api_value(app, "project path")]
+        command = [*frk, "onboard"]
         for flag, value in (
             ("--name", args.name),
             ("--platforms", args.platforms),
@@ -2757,13 +2783,13 @@ def api_action_command(args) -> list[str]:
                 command += [flag, value]
         if args.dry_run:
             command.append("--dry-run")
-        return command
+        return [*command, "--", app]
     if action in ("build", "validate", "release"):
         platform = require_api_value(args.platform, "platform")
         if action == "validate" and platform != "android":
             raise ValueError("validate is available for Android only; TestFlight has no dry-run upload")
         command_name = "release" if action in ("validate", "release") else "build"
-        command = [*frk, command_name, platform, require_api_value(app, "project")]
+        command = [*frk, command_name]
         if args.build_name:
             command += ["--build-name", args.build_name]
         if args.build_number:
@@ -2775,7 +2801,9 @@ def api_action_command(args) -> list[str]:
                 command.append("--skip-tests")
             if args.skip_build:
                 command.append("--skip-build")
-        return command
+        # Keep both positionals together: Python 3.9 argparse cannot resume an
+        # optional positional after options inserted between platform and app.
+        return [*command, "--", platform, app]
     raise ValueError(f"unsupported API action: {action}")
 
 
@@ -2797,6 +2825,7 @@ def cmd_api_run(args) -> int:
     environment = os.environ.copy()
     environment["FASTLANE_DISABLE_COLORS"] = "1"
     environment["TERM"] = "dumb"
+    environment["_FRK_API_PARENT_PID"] = str(os.getpid())
     # No cwd: `frk api run doctor .` has to mean the same directory as
     # `frk doctor .`, so the child inherits the caller's. Nothing in it needs
     # the kit checkout — KIT_ROOT and CLI_ENTRYPOINT are absolute, and

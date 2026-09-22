@@ -62,6 +62,9 @@ The project argument is optional when the command is run inside an onboarded
 project directory. On macOS, `frk release` keeps the machine awake while
 Fastlane is running.
 
+Press Ctrl+C to cancel a running command. FRK stops its Fastlane process and
+helpers before returning; cancellation cannot undo a store-accepted upload.
+
 That is the normal workflow. For signing, platform detection, and uncommon
 errors, use the [onboarding guide](docs/ONBOARDING.md).
 
@@ -120,6 +123,11 @@ forgetting one app cannot discard another concurrent update. Re-registering
 the same app preserves its original registration date and existing metadata.
 Track and build-flag edits also preserve unrelated project settings and refuse
 ambiguous YAML before writing. No configuration migration is required.
+
+After a project is renamed in its release configuration, both its displayed
+name and original registered name remain usable. If names overlap across apps,
+FRK asks for an explicit path rather than choosing one. These lookups do not
+rewrite the registry or project files.
 
 The repository layout is intentionally small:
 
@@ -186,6 +194,8 @@ frk list      Show explicitly managed projects
 frk forget    Remove only a registry entry
 frk status    Inspect toolkit and shared credential state
 frk signing   Import, link, audit Android keys; set up iOS distribution signing
+frk build-args View or set extra Flutter build flags per platform
+frk track     View or change the Google Play testing track
 ```
 
 Run `frk COMMAND --help` for command-specific options. Advanced users can also

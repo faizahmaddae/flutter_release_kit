@@ -305,6 +305,54 @@ class FrkTestCase(unittest.TestCase):
 
         self.assertEqual(app.resolve(), frk.resolve_app("portable"))
 
+    def test_current_and_registered_names_resolve_without_rewriting_the_registry(self):
+        app = self.make_android_app("original")
+        frk.register_project(app)
+        registry = frk.registry_path().read_bytes()
+        config = app / frk.CONFIG_NAME
+        config.write_text(config.read_text().replace("name: original", "name: renamed"))
+
+        for name in ("original", "renamed"):
+            with self.subTest(name=name):
+                self.assertEqual(app.resolve(), frk.resolve_app(name))
+                self.assertEqual(str(app.resolve()), frk.api_find_project(name)["path"])
+        self.assertEqual(registry, frk.registry_path().read_bytes())
+
+    def test_ambiguous_current_names_require_an_explicit_path(self):
+        first = self.make_android_app("first")
+        second = self.make_android_app("second")
+        for app in (first, second):
+            frk.register_project(app)
+        config = first / frk.CONFIG_NAME
+        config.write_text(config.read_text().replace("name: first", "name: second"))
+
+        for resolve in (frk.resolve_app, frk.api_find_project):
+            with self.subTest(resolve=resolve.__name__):
+                with self.assertRaises(SystemExit):
+                    resolve("second")
+        for app in (first, second):
+            self.assertEqual(app.resolve(), frk.resolve_app(str(app)))
+            self.assertEqual(str(app.resolve()), frk.api_find_project(str(app))["path"])
+
+    def test_api_resolves_registered_paths_even_when_the_directory_is_missing(self):
+        app = self.make_android_app("missing")
+        frk.register_project(app)
+        shutil.rmtree(app)
+        self.assertEqual(str(app.resolve()), frk.api_find_project(str(app))["path"])
+
+    def test_api_does_not_resolve_an_unregistered_existing_path_as_another_apps_name(self):
+        app = self.make_android_app("managed")
+        frk.register_project(app)
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "managed").mkdir()
+        process = subprocess.run(
+            [sys.executable, str(FRK_PATH), "api", "project", "managed"],
+            cwd=elsewhere, capture_output=True, text=True, timeout=10,
+        )
+        self.assertNotEqual(0, process.returncode)
+        self.assertEqual("project_not_found", json.loads(process.stdout)["error"]["code"])
+
     def test_forget_removes_only_the_registry_entry_and_preserves_the_project(self):
         app = self.make_android_app("removable")
         marker = app / "keep-me.txt"
@@ -1300,7 +1348,7 @@ frk.register_project(Path(sys.argv[2]))
         with (
             patch.object(frk.sys, "platform", "darwin"),
             patch.object(frk.shutil, "which", side_effect=lambda name: f"/usr/bin/{name}"),
-            patch.object(frk.subprocess, "call", return_value=0) as call,
+            patch.object(frk.subprocess, "Popen", return_value=FakeChild()) as call,
         ):
             self.assertEqual(
                 0,
@@ -1311,6 +1359,13 @@ frk.register_project(Path(sys.argv[2]))
             ["caffeinate", "-ims", "fastlane", "android", "release"],
             call.call_args.args[0],
         )
+        self.assertTrue(call.call_args.kwargs["start_new_session"])
+
+    def test_fastlane_signal_exit_uses_the_standard_shell_exit_code(self):
+        command = [sys.executable, "-c", "import os, signal; os.kill(os.getpid(), signal.SIGTERM)"]
+        with (patch.object(frk, "fastlane_installed", return_value=True),
+              patch.object(frk, "fastlane_command", return_value=command)):
+            self.assertEqual(143, frk.run_fastlane(self.root, ["verify"]))
 
     def test_invalid_or_ambiguous_release_versions_fail_early(self):
         invalid = argparse.Namespace(
@@ -1381,10 +1436,44 @@ frk.register_project(Path(sys.argv[2]))
         self.assertIn("--link", signing)
 
         ios_setup = frk.api_action_command(self.api_run_args("ios-setup-signing", "sample"))
-        self.assertEqual([frk.sys.executable, str(FRK_PATH), "signing", "ios-setup", "sample"], ios_setup)
+        self.assertEqual([frk.sys.executable, str(FRK_PATH), "signing", "ios-setup", "--", "sample"], ios_setup)
 
         forget = frk.api_action_command(self.api_run_args("forget", "sample"))
-        self.assertEqual([frk.sys.executable, str(FRK_PATH), "forget", "sample"], forget)
+        self.assertEqual([frk.sys.executable, str(FRK_PATH), "forget", "--", "sample"], forget)
+
+    def test_api_never_ignores_an_unsupported_dry_run(self):
+        for action in frk.API_RUN_ACTIONS:
+            if action == "onboard":
+                continue
+            with self.subTest(action=action):
+                self.stdout.seek(0)
+                self.stdout.truncate()
+                args = self.api_run_args(action, "sample", platform="android", dry_run=True)
+                with patch.object(frk.subprocess, "Popen", side_effect=AssertionError("unsupported preview started work")) as spawn:
+                    self.assertEqual(2, frk.cmd_api_run(args))
+                spawn.assert_not_called()
+                events = [json.loads(line) for line in self.stdout.getvalue().splitlines()]
+                self.assertEqual(["error", "finished"], [event["type"] for event in events])
+                self.assertEqual("invalid_request", events[0]["code"])
+                self.assertIn("--dry-run", events[0]["message"])
+                self.assertFalse(events[-1]["success"])
+        self.assertIn("--dry-run", frk.api_action_command(self.api_run_args("onboard", "sample", dry_run=True)))
+
+    def test_api_keeps_project_values_separate_from_child_cli_options(self):
+        parser = self.build_frk_parser()
+        for action in frk.API_RUN_ACTIONS:
+            if action == "status":
+                continue
+            for project in ("--skip-tests", "--help", "a project with spaces"):
+                with self.subTest(action=action, project=project):
+                    command = frk.api_action_command(self.api_run_args(
+                        action, project, platform="android", build_name="2.1.0", build_number="42",
+                    ))
+                    parsed = parser.parse_args(command[2:])
+                    self.assertEqual(project, parsed.app_dir)
+                    self.assertFalse(getattr(parsed, "skip_tests", False))
+                    if action in ("build", "validate", "release"):
+                        self.assertEqual(("2.1.0", "42"), (parsed.build_name, parsed.build_number))
 
     def test_cli_entrypoint_names_the_shipped_command_beside_the_shared_lanes(self):
         # Located from the repository layout rather than from bin/frk's own
@@ -3517,13 +3606,15 @@ if os.environ.get('FRK_TEST_LEADER_EXITS') != '1':
             time.sleep(0.01)
         self.fail("cancelled fixture process is still running")
 
-    def run_real_api_cancellation(self, *, streaming=False, signum=None, resist=False):
+    def run_real_api_cancellation(self, *, streaming=False, direct=False, signum=None, resist=False):
         app = self.make_android_app("cancel-app")
         frk.register_project(app)
         _, environment, leader, leaf = self.cancellation_worker()
         environment["FRK_TEST_RESIST"] = "1" if resist else "0"
         args = (["api", "run", "build", str(app), "--platform", "android"] if streaming
                 else ["api", "store-versions", str(app)])
+        if direct:
+            args = ["build", "android", str(app)]
         unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
         process = subprocess.Popen([sys.executable, str(FRK_PATH), *args], env=environment,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -3567,6 +3658,16 @@ if os.environ.get('FRK_TEST_LEADER_EXITS') != '1':
         self.assertEqual("finished", events[-1]["type"])
         self.assertFalse(events[-1]["success"])
         self.assertEqual(code, events[-1]["exitCode"])
+
+    def test_direct_cli_cancellation_stops_stubborn_helpers(self):
+        code, _, error = self.run_real_api_cancellation(direct=True, resist=True)
+        self.assertEqual(143, code, error)
+        self.assertNotIn("Traceback", error)
+
+    def test_direct_cli_ctrl_c_stops_helpers_without_a_traceback(self):
+        code, _, error = self.run_real_api_cancellation(direct=True, signum=frk.signal.SIGINT)
+        self.assertEqual(130, code, error)
+        self.assertNotIn("Traceback", error)
 
     def test_timeout_stops_a_helper_after_its_original_parent_exits(self):
         worker, environment, leader, leaf = self.cancellation_worker()
@@ -4084,9 +4185,8 @@ if os.environ.get('FRK_TEST_LEADER_EXITS') != '1':
         ]
 
         self.assertEqual([], untimed)
-        # The bounded calls are the short probes. The two unbounded children are
-        # deliberate: run_fastlane's `call` is a build that legitimately takes
-        # an hour, and `api run`'s Popen is the stream the client cancels.
+        # The bounded calls are short probes. Build children and the API stream
+        # can legitimately run for an hour; their cancellation owns the group.
         self.assertTrue(list(self.subprocess_calls(calls, {"run"})))
 
     def test_every_text_mode_child_in_the_cli_pins_its_decoding(self):

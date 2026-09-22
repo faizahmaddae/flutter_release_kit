@@ -17,9 +17,17 @@ frk api build-args example_app
 
 Each command writes one compact JSON document to stdout. `capabilities` reports
 the supported desktop protocol range and must be checked before other calls.
-All of these are local except `store-versions`, which talks to the stores; it
-has its own section below. `set-build-args` is the one write among the local
-commands and has its own section too, under "Extra build flags".
+These discovery commands are read-only. All are local except `store-versions`,
+which talks to the stores and has its own section below. The local write
+commands are `configure-credentials`, `set-build-args`, and `set-track`.
+
+Project lookup accepts the current configuration name, the original registered
+name, or the registered path, including a path whose directory is missing.
+Existing paths take precedence over names, consistently with the human CLI.
+An ambiguous name is rejected with `command_failed` and a diagnostic asking for
+the full path; lookup never rewrites the registry to reconcile a rename.
+For a name beginning with `-`, put `--` before the project argument. Streaming
+actions preserve that argument as a project value when invoking the human CLI.
 
 `api credentials` reports readiness, public account labels, and resolved paths;
 it never returns private-key contents. Desktop clients configure one store with:
@@ -311,8 +319,8 @@ not a local-only check.
 ### Action flags
 
 The project argument is optional in the parser, but every action except `status`
-fails with `invalid_request` when it is omitted. Flags that do not apply to the
-selected action are accepted by the parser and ignored.
+fails with `invalid_request` when it is omitted. Except for `--dry-run`, flags
+that do not apply to the selected action are accepted by the parser and ignored.
 
 | Flag | Actions | Purpose |
 |---|---|---|
@@ -332,6 +340,12 @@ selected action are accepted by the parser and ignored.
 | `--keystore` | `signing-import` | Selected `.jks` or `.keystore` |
 | `--force` | `signing-import` | Replace a different vault copy |
 | `--link` | `signing-import` | Link the project after copying |
+
+`api run --dry-run` is supported only for `onboard`. With another action it
+returns `invalid_request` and a failed `finished` event before starting work;
+the preview flag is never silently ignored. For Google Play validation use
+`frk api run validate example_app --platform android`. The human CLI continues
+to support `frk release android example_app --dry-run`.
 
 ## Event fields
 
@@ -396,7 +410,7 @@ whose `code` and `message` are top-level event fields, not a nested object.
 | `project_not_found` | `api project`, `api setup`, `api store-versions`, `api build-args`, `api set-build-args`, `api set-track` | The named project or path is not in the opt-in registry |
 | `invalid_credentials` | `api configure-credentials` | The source file is missing or failed validation, or a different vault copy exists and `--force` was not supplied |
 | `credential_vault_unavailable` | `api configure-credentials` | The chosen file is fine but `~/.flutter-release` could not be written — distinct from `invalid_credentials` so a client can tell "pick another file" from "fix the vault" |
-| `invalid_request` | `api run` | The action and arguments cannot be mapped to a command: a missing project or `--platform`, or `validate` with a non-Android platform |
+| `invalid_request` | `api run` | The action and arguments cannot be mapped to a command: a missing project or `--platform`, `validate` with a non-Android platform, or unsupported `--dry-run` |
 | `stream_failed` | `api run` | Reading or forwarding the child's output raised. Emitted after `started`; the child's process group is killed and `finished` follows with `success: false` |
 | `project_unavailable` | `api store-versions`, `api build-args`, `api set-build-args`, `api set-track` | The registered project directory no longer exists |
 | `project_not_onboarded` | `api store-versions` | The project has no shared Fastfile import or release configuration |
