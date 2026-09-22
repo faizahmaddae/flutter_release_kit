@@ -137,6 +137,19 @@ struct ProjectSummary: Codable, Identifiable, Equatable, Hashable {
 }
 
 extension ProjectSummary {
+    /// Local setup only; store permissions are checked separately by the CLI.
+    var setupLabel: String {
+        if !exists { return "Folder missing" }
+        if !onboarded || !isReady || platforms.isEmpty { return "Setup required" }
+        if platforms.contains(where: { !readiness(for: $0).ready }) { return "Signing required" }
+        return "Signing ready"
+    }
+
+    var needsSetup: Bool {
+        !exists || !onboarded || !isReady || platforms.isEmpty
+            || platforms.contains(where: { !readiness(for: $0).ready })
+    }
+
     /// Badge state for one platform card. `signingReady` is optional on iOS because
     /// older CLIs omit it, so the profile flag is the documented fallback.
     func readiness(for platform: PlatformKind) -> (ready: Bool, label: String) {

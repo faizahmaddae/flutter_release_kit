@@ -115,12 +115,19 @@ The central registry at `~/.flutter-release/projects.json` records the exact
 absolute paths that were onboarded. Copying the generated configuration to
 another checkout does not enroll it on that machine.
 
+Registry updates are serialized across FRK processes, so registering or
+forgetting one app cannot discard another concurrent update. Re-registering
+the same app preserves its original registration date and existing metadata.
+Track and build-flag edits also preserve unrelated project settings and refuse
+ambiguous YAML before writing. No configuration migration is required.
+
 The repository layout is intentionally small:
 
 ```text
 flutter_release_kit/
 ├── bin/frk                  CLI for onboarding, checks, builds, and releases
 ├── desktop/ReleaseKitApp/   native SwiftUI control surface for macOS
+├── integrations/mcp/        optional local AI tools using the existing API
 ├── fastlane/Fastfile        shared release lanes
 ├── templates/               app Fastfile and .gitignore templates
 ├── tests/                   dependency-free CLI tests
@@ -205,6 +212,17 @@ open "dist/Flutter Release Kit.app"
 
 See the [desktop app guide](desktop/ReleaseKitApp/README.md) and the
 [machine API contract](docs/MACHINE_API.md).
+
+## Claude, ChatGPT, and Codex
+
+The optional local MCP server lets compatible AI clients inspect managed apps,
+check store versions, build, upload to testing destinations, and follow or cancel
+jobs. It uses the existing machine API and keeps project configuration and
+signing management in FRK. The adapter's SDK dependencies are isolated from the
+standard-library CLI.
+
+See [MCP setup and usage](docs/MCP.md) for Claude Desktop, Claude Code, and Codex
+configuration, example requests, and the separate requirements for browser chats.
 
 ## Design constraints
 

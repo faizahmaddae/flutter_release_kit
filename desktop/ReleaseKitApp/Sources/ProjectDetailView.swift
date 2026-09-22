@@ -6,7 +6,7 @@ struct ProjectDetailView: View {
     /// Empty means no dialog.
     @State private var pendingRelease: [PlatformKind] = []
     @State private var pendingValidation = false
-    @State private var showSetupAssistant = false
+    @State private var setupPlatform: PlatformKind?
     @State private var pendingRemoval = false
     @State private var newAndroidBuildArg = ""
     @State private var newIOSBuildArg = ""
@@ -21,17 +21,26 @@ struct ProjectDetailView: View {
                     VStack(alignment: .leading, spacing: 18) {
                         projectHeader(project)
                         releaseVersionCard(project)
-                        buildArgsCard(project)
-                        screenshotStudioCard(project)
 
-                        ForEach(project.platforms) { platform in
-                            platformCard(project, platform: platform)
+                        if geometry.size.width >= 900 && project.platforms.count > 1 {
+                            HStack(alignment: .top, spacing: 16) {
+                                ForEach(project.platforms) { platform in
+                                    platformCard(project, platform: platform)
+                                        .frame(maxWidth: .infinity)
+                                }
+                            }
+                        } else {
+                            ForEach(project.platforms) { platform in
+                                platformCard(project, platform: platform)
+                            }
                         }
 
                         artifactsCard(project)
+                        buildArgsCard(project)
+                        screenshotStudioCard(project)
                     }
                     .padding(geometry.size.width < 720 ? 16 : 24)
-                    .frame(maxWidth: 760, alignment: .leading)
+                    .frame(maxWidth: 940, alignment: .leading)
                     .frame(maxWidth: .infinity, alignment: .center)
                 }
             }
@@ -87,9 +96,9 @@ struct ProjectDetailView: View {
         } message: {
             Text("Only the entry in Flutter Release Kit will be removed. The project folder, source code, release configuration, signing files, and build artifacts will not be deleted or changed.")
         }
-        .sheet(isPresented: $showSetupAssistant) {
+        .sheet(item: $setupPlatform) { platform in
             if let project {
-                SetupAssistantView(project: project)
+                SetupAssistantView(project: project, platform: platform)
                     .environmentObject(model)
             }
         }
@@ -160,6 +169,8 @@ struct ProjectDetailView: View {
                     .font(.title3)
             }
             .menuStyle(.borderlessButton)
+            .fixedSize()
+            .accessibilityLabel("Project actions")
             .disabled(model.isRunning)
             .help("Project actions: reveal, inspect, verify, or remove this project from the managed list.")
         }
@@ -168,14 +179,14 @@ struct ProjectDetailView: View {
     @ViewBuilder
     private func projectName(_ project: ProjectSummary) -> some View {
         Text(project.name)
-            .font(.largeTitle.bold())
+            .font(.title.bold())
             .lineLimit(1)
             .minimumScaleFactor(0.8)
     }
 
     @ViewBuilder
     private func onboardingBadge(_ project: ProjectSummary) -> some View {
-        StatusBadge(text: project.isReady ? "Onboarded" : "Needs attention", isReady: project.isReady)
+        StatusBadge(text: project.setupLabel, isReady: !project.needsSetup)
     }
 
     @ViewBuilder
@@ -215,9 +226,16 @@ struct ProjectDetailView: View {
 
                 Divider()
 
-                VStack(alignment: .leading, spacing: 12) {
-                    ForEach(project.platforms) { platform in
-                        buildNumberRow(platform)
+                ViewThatFits(in: .horizontal) {
+                    HStack(alignment: .top, spacing: 24) {
+                        ForEach(project.platforms) { platform in
+                            buildNumberRow(platform)
+                        }
+                    }
+                    VStack(alignment: .leading, spacing: 12) {
+                        ForEach(project.platforms) { platform in
+                            buildNumberRow(platform)
+                        }
                     }
                 }
 
@@ -346,7 +364,7 @@ struct ProjectDetailView: View {
 
     private func addBuildArg(_ platform: PlatformKind, projectID: String, own: [String]) {
         let value = currentBuildArgDraft(platform).trimmingCharacters(in: .whitespaces)
-        guard !value.isEmpty else { return }
+        guard !model.isSavingBuildArgs, !value.isEmpty else { return }
         if platform == .android { newAndroidBuildArg = "" } else { newIOSBuildArg = "" }
         Task { await model.setBuildArgs(for: projectID, platform: platform, args: own + [value]) }
     }
@@ -361,7 +379,7 @@ struct ProjectDetailView: View {
                     Button("Stop") {
                         model.cancelStoreCheck()
                     }
-                    .help("Stop waiting for the stores. Nothing was changed in either store; the query itself keeps running on its own for a short while.")
+                    .help("Cancel the store query and ask FRK to stop its helper processes. Nothing is built, uploaded, or changed in either store.")
                 } else {
                     Button("Check stores") {
                         model.checkStoreVersions()
@@ -644,15 +662,16 @@ struct ProjectDetailView: View {
     @ViewBuilder
     private func versionChecks(_ project: ProjectSummary) -> some View {
         HStack(spacing: 10) {
-            Button("Doctor") {
+            Button("Check Setup") {
                 model.start(FRKRunRequest(action: .doctor, project: project.id))
             }
             .help(doctorHelp(project))
-            Button("Verify") {
+            Button("Analyze & Test") {
                 model.start(FRKRunRequest(action: .verify, project: project.id))
             }
             .help(verifyHelp(project))
         }
+        .disabled(model.isRunning)
     }
 
     @ViewBuilder
@@ -660,25 +679,26 @@ struct ProjectDetailView: View {
         let readiness = project.readiness(for: platform)
         SectionCard {
             VStack(alignment: .leading, spacing: 15) {
-                HStack {
-                    Label(platform.title, systemImage: platform.systemImage)
-                        .font(.title3.weight(.semibold))
-                    Spacer()
-                    StatusBadge(text: readiness.label, isReady: readiness.ready)
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Label(platform.title, systemImage: platform.systemImage)
+                            .font(.title3.weight(.semibold))
+                        Spacer()
+                        StatusBadge(text: readiness.label, isReady: readiness.ready)
+                    }
+                    Text(platform == .android
+                         ? "Google Play · \(Self.playTrackDisplayName(project.android?.track))"
+                         : "App Store Connect · TestFlight")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
 
-                Divider()
-
-                platformDetails(project, platform: platform)
-
                 if !readiness.ready {
-                    HStack(spacing: 10) {
-                        Label("Release setup is incomplete", systemImage: "exclamationmark.triangle.fill")
-                            .font(.callout.weight(.medium))
-                            .foregroundStyle(.orange)
-                        Spacer()
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Complete signing setup to enable builds and uploads.")
+                            .font(.caption)
                         Button {
-                            showSetupAssistant = true
+                            setupPlatform = platform
                         } label: {
                             Label("Fix Setup", systemImage: "wrench.and.screwdriver")
                         }
@@ -687,26 +707,27 @@ struct ProjectDetailView: View {
                         .help("Inspect the missing signing or release requirements and open the guided repair assistant. Nothing is uploaded.")
                     }
                     .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
                 }
 
                 if readiness.ready && !storeCredentialsConfigured(for: platform) {
-                    HStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 8) {
                         Label(
                             platform == .android
                                 ? "Google Play credentials are not configured"
                                 : "App Store Connect credentials are not configured",
                             systemImage: "key.horizontal.fill"
                         )
-                        .font(.callout.weight(.medium))
+                        .font(.caption)
                         .foregroundStyle(.orange)
-                        Spacer()
                         Button("Open Settings") {
                             model.showSettings = true
                         }
                         .help("Open Store Credentials settings for this Mac. Local builds remain available without store credentials.")
                     }
                     .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
                 }
 
@@ -732,6 +753,19 @@ struct ProjectDetailView: View {
                     }
                 }
                 .disabled(model.isRunning || !model.canRunVersionedAction(for: platform) || !readiness.ready)
+
+                Divider()
+                DisclosureGroup("Signing & destination") {
+                    platformDetails(project, platform: platform)
+                        .padding(.top, 8)
+                    if platform == .android {
+                        Text("Track changes are saved immediately for this project.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .padding(.top, 4)
+                    }
+                }
+                .font(.callout)
             }
         }
     }
@@ -742,7 +776,7 @@ struct ProjectDetailView: View {
         Button {
             model.start(buildRequest)
         } label: {
-            Label("Build", systemImage: "hammer")
+            Label("Build Locally", systemImage: "hammer")
         }
         .buttonStyle(.bordered)
         .help(buildHelp(buildRequest, platform: platform))
@@ -952,11 +986,10 @@ struct ProjectDetailView: View {
     /// Upload builds for you. This is the one-line version of that; the Help window (⌘?)
     /// has the long version.
     private func releaseStepsCaption(_ platform: PlatformKind) -> String {
-        let upload = releaseButtonTitle(platform)
         if platform == .android {
-            return "\(upload) is the only button you need — it builds and publishes in one step. Build only compiles; Validate checks Google Play without publishing."
+            return "Build creates a local AAB. Upload builds and sends it to the testing track above. Validate checks it with Google Play."
         }
-        return "\(upload) is the only button you need — it builds and publishes in one step. Build only compiles, nothing more. (Apple has no publish-free check, so there's no Validate here.)"
+        return "Build creates a local IPA. Upload builds and sends it to TestFlight for testing."
     }
 
     private func buildHelp(_ request: FRKRunRequest, platform: PlatformKind) -> String {

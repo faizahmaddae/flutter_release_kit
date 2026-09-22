@@ -7,12 +7,14 @@ struct SetupAssistantView: View {
     @Environment(\.dismiss) private var dismiss
 
     let project: ProjectSummary
+    let platform: PlatformKind
 
     @State private var selectedPropertiesPath: String?
     @State private var selectedKeystorePath: String?
     @State private var pendingAndroidImport = false
     @State private var pendingIOSRepair = false
     @State private var showLostKeyHelp = false
+    @State private var showStoreConnections = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -21,25 +23,23 @@ struct SetupAssistantView: View {
 
             ScrollView {
                 Group {
-                    if model.isLoadingSetup && model.setupStatus == nil {
+                    if model.isLoadingSetup && model.setupStatus?.projectId != project.id {
                         ProgressView("Inspecting release setup…")
                             .frame(maxWidth: .infinity, minHeight: 260)
                     } else if let status = model.setupStatus,
                               status.projectId == project.id {
                         VStack(spacing: 16) {
-                            if let android = status.android {
+                            if platform == .android, let android = status.android {
                                 androidCard(android)
-                            }
-                            if let ios = status.ios {
+                            } else if platform == .ios, let ios = status.ios {
                                 iosCard(ios)
+                            } else {
+                                setupUnavailable
                             }
                         }
+                        .disabled(model.isLoadingSetup || model.isRunning)
                     } else {
-                        ContentUnavailableView(
-                            "Setup status unavailable",
-                            systemImage: "exclamationmark.triangle",
-                            description: Text("Run the check again or verify the CLI connection in Settings.")
-                        )
+                        setupUnavailable
                     }
                 }
                 .padding(22)
@@ -55,19 +55,19 @@ struct SetupAssistantView: View {
         .onDisappear {
             model.clearSetupStatus()
         }
+        .sheet(isPresented: $showStoreConnections, onDismiss: {
+            Task { await model.loadSetupStatus(for: project.id) }
+        }) {
+            StoreConnectionsView(presentation: .settings)
+                .environmentObject(model)
+        }
         .confirmationDialog(
             "Import this Android upload key?",
             isPresented: $pendingAndroidImport,
             titleVisibility: .visible
         ) {
             Button("Import to Vault & Link Project") {
-                model.start(FRKRunRequest(
-                    action: .signingImport,
-                    project: project.id,
-                    propertiesPath: selectedPropertiesPath,
-                    keystorePath: selectedKeystorePath,
-                    link: true
-                ))
+                model.start(signingImportRequest)
                 dismiss()
             }
             Button("Cancel", role: .cancel) {}
@@ -85,7 +85,7 @@ struct SetupAssistantView: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("FRK will repair ExportOptions locally (backing up an existing file), then use your App Store Connect API key to reuse or create an Apple Distribution certificate and refresh this app's provisioning profile. Apple account state may change; no build will be uploaded.")
+            Text("FRK will update export settings and Xcode's Release signing configuration, backing up existing files. Your App Store Connect API key will be used to reuse or create an Apple Distribution certificate and refresh this app's provisioning profile. Apple account state may change; no build will be uploaded.")
         }
     }
 
@@ -97,15 +97,23 @@ struct SetupAssistantView: View {
                 .frame(width: 46, height: 46)
                 .background(Color.frkAccent.gradient, in: RoundedRectangle(cornerRadius: 12))
             VStack(alignment: .leading, spacing: 3) {
-                Text("Finish release setup")
+                Text("\(platform.title) setup")
                     .font(.title2.bold())
-                Text("\(project.name) · Fix only what is missing")
+                Text("\(project.name) · Review signing and resolve setup issues")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
             Spacer()
         }
         .padding(22)
+    }
+
+    private var setupUnavailable: some View {
+        ContentUnavailableView(
+            "\(platform.title) setup status unavailable",
+            systemImage: "exclamationmark.triangle",
+            description: Text("Check again or verify the CLI connection in Settings.")
+        )
     }
 
     private var footer: some View {
@@ -117,23 +125,32 @@ struct SetupAssistantView: View {
             Button {
                 Task { await model.loadSetupStatus(for: project.id) }
             } label: {
-                Label("Check Again", systemImage: "arrow.clockwise")
+                HStack(spacing: 6) {
+                    if model.isLoadingSetup {
+                        ProgressView().controlSize(.small)
+                    }
+                    Label(model.isLoadingSetup ? "Checking…" : "Check Again", systemImage: "arrow.clockwise")
+                }
             }
             .disabled(model.isLoadingSetup || model.isRunning)
             .help("Re-read local project files, Keychain identities, provisioning profiles, Git safety, and vault links. Nothing is repaired or uploaded.")
-            Button("Run Doctor") {
+            Button("Run Full Check") {
                 model.start(FRKRunRequest(action: .doctor, project: project.id))
                 dismiss()
             }
-            .buttonStyle(.borderedProminent)
-            .disabled(model.isRunning)
-            .help("Run the complete release-readiness check and show its output in Activity. No build is uploaded.\nCommand: \(FRKRunRequest(action: .doctor, project: project.id).commandPreview)")
+            .disabled(model.isLoadingSetup || model.isRunning)
+            .help("Check both platforms, local tools, and store access, and show the results in Activity. This may contact the stores; it does not repair setup or upload a build.\nCommand: \(FRKRunRequest(action: .doctor, project: project.id).commandPreview)")
         }
         .padding(18)
     }
 
     @ViewBuilder
     private func androidCard(_ status: AndroidSetupStatus) -> some View {
+        let localKeyIsValid = status.projectPropertiesExists
+            && status.propertiesComplete
+            && status.keystoreExists
+            && status.keystoreValidationStatus == "valid"
+
         SectionCard {
             VStack(alignment: .leading, spacing: 14) {
                 HStack {
@@ -174,45 +191,26 @@ struct SetupAssistantView: View {
                     state: (status.gitSafe ?? !status.gitTracked) ? .ready : .error
                 )
 
-                SetupCheckRow(
-                    title: "Private vault",
-                    detail: status.vaultDetail,
-                    state: status.vaultReady && status.projectLinked ? .ready : .warning
-                )
+                if status.vaultReady && status.projectLinked {
+                    SetupCheckRow(title: "Private vault", detail: status.vaultDetail, state: .ready)
+                }
 
-                if status.vaultReady && !status.projectLinked {
-                    Button {
-                        model.start(FRKRunRequest(action: .signingLink, project: project.id))
-                        dismiss()
-                    } label: {
-                        Label("Link Protected Copy", systemImage: "link")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .help("Point this project's ignored android/key.properties to the already protected copy in the private vault. The keystore is not copied again.\nCommand: \(FRKRunRequest(action: .signingLink, project: project.id).commandPreview)")
-                } else {
-                    let localKeyIsValid = status.projectPropertiesExists
-                        && status.propertiesComplete
-                        && status.keystoreExists
-                        && status.keystoreValidationStatus == "valid"
-                    if localKeyIsValid && !status.vaultReady {
-                        Button {
-                            pendingAndroidImport = true
-                        } label: {
-                            Label("Protect in Vault & Link", systemImage: "lock.shield")
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .help("Validate the current key.properties and keystore, preserve their source, copy a protected version into the private vault, back up the project pointer, and link it.\nCommand: \(signingImportRequest.commandPreview)")
-                    } else if !localKeyIsValid {
+                if !localKeyIsValid {
+                    if status.vaultReady && !status.projectLinked {
+                        linkProtectedCopyButton
+                            .buttonStyle(.borderedProminent)
+                    } else {
                         signingFileControls(status)
                     }
+                }
 
-                    if status.gradleConfigured == false,
-                       let path = status.gradleConfigurationPath {
-                        Button("Open Gradle Configuration") {
-                            openPath(path)
-                        }
-                        .help("Open the Gradle file that FRK inspected so you can wire the release signing configuration manually.\nPath: \(path)")
+                if status.gradleConfigured == false,
+                   let path = status.gradleConfigurationPath {
+                    Button("Open Gradle Configuration") {
+                        openPath(path)
                     }
+                    .buttonStyle(.borderedProminent)
+                    .help("Open the Gradle file that FRK inspected so you can wire the release signing configuration manually.\nPath: \(path)")
                 }
 
                 if status.gitSafe == false {
@@ -221,22 +219,56 @@ struct SetupAssistantView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                DisclosureGroup("I cannot find the original upload key", isExpanded: $showLostKeyHelp) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Do not generate a replacement silently. Existing Play apps require an Upload Key Reset in Google Play Console; the App Signing key remains managed by Google.")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                        Button("Open Google Play Console") {
-                            openURL("https://play.google.com/console")
+                if localKeyIsValid && (!status.vaultReady || !status.projectLinked) {
+                    DisclosureGroup("Optional: protect a copy in the vault") {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text(status.vaultDetail)
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                            if status.vaultReady {
+                                linkProtectedCopyButton
+                            } else {
+                                Button {
+                                    pendingAndroidImport = true
+                                } label: {
+                                    Label("Protect in Vault & Link…", systemImage: "lock.shield")
+                                }
+                                .help("Validate the current key.properties and keystore, preserve their source, copy a protected version into the private vault, back up the project pointer, and link it.\nCommand: \(signingImportRequest.commandPreview)")
+                            }
                         }
-                        .help("Open Google Play Console in the browser to request an Upload Key Reset. FRK does not generate or submit the reset request automatically.")
+                        .padding(.top, 6)
                     }
-                    .padding(.top, 6)
+                    .font(.callout)
                 }
-                .font(.callout)
-                .help("Use this only when the original Android upload key is genuinely unavailable. Creating a random replacement will not work for an existing Play app.")
+
+                if !localKeyIsValid {
+                    DisclosureGroup("I cannot find the original upload key", isExpanded: $showLostKeyHelp) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Do not generate a replacement silently. Existing Play apps require an Upload Key Reset in Google Play Console; the App Signing key remains managed by Google.")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                            Button("Open Google Play Console") {
+                                openURL("https://play.google.com/console")
+                            }
+                            .help("Open Google Play Console in the browser to request an Upload Key Reset. FRK does not generate or submit the reset request automatically.")
+                        }
+                        .padding(.top, 6)
+                    }
+                    .font(.callout)
+                    .help("Use this only when the original Android upload key is genuinely unavailable. Creating a random replacement will not work for an existing Play app.")
+                }
             }
         }
+    }
+
+    private var linkProtectedCopyButton: some View {
+        Button {
+            model.start(FRKRunRequest(action: .signingLink, project: project.id))
+            dismiss()
+        } label: {
+            Label("Link Protected Copy", systemImage: "link")
+        }
+        .help("Point this project's ignored android/key.properties to the already protected copy in the private vault. The keystore is not copied again.\nCommand: \(FRKRunRequest(action: .signingLink, project: project.id).commandPreview)")
     }
 
     @ViewBuilder
@@ -247,19 +279,26 @@ struct SetupAssistantView: View {
                     || !status.propertiesComplete
                     || status.keystoreValidationStatus == "invalid" {
                     Button("Choose key.properties…") {
-                        selectedPropertiesPath = chooseFile(
+                        if let path = chooseFile(
                             title: "Choose the original key.properties",
                             extensions: ["properties"]
-                        )
+                        ) {
+                            if path != selectedPropertiesPath {
+                                selectedKeystorePath = nil
+                            }
+                            selectedPropertiesPath = path
+                        }
                     }
                     .help("Choose the original complete Android key.properties containing storeFile, storePassword, keyAlias, and keyPassword. Its secret values are never displayed or passed as command arguments.")
                 }
                 if status.propertiesComplete || selectedPropertiesPath != nil {
                     Button("Choose Keystore…") {
-                        selectedKeystorePath = chooseFile(
+                        if let path = chooseFile(
                             title: "Choose the original Android upload key",
                             extensions: ["jks", "keystore"]
-                        )
+                        ) {
+                            selectedKeystorePath = path
+                        }
                     }
                     .help("Choose the original .jks or .keystore referenced by key.properties. FRK validates it together with the properties file and preserves the source.")
                 }
@@ -277,7 +316,7 @@ struct SetupAssistantView: View {
                 Button {
                     pendingAndroidImport = true
                 } label: {
-                    Label("Import & Link", systemImage: "square.and.arrow.down")
+                    Label("Import & Link…", systemImage: "square.and.arrow.down")
                 }
                 .buttonStyle(.borderedProminent)
                 .help("Validate the selected signing pair, copy a private protected version into the vault, back up any current project pointer, and link the project.\nCommand: \(signingImportRequest.commandPreview)")
@@ -365,18 +404,19 @@ struct SetupAssistantView: View {
                             .help("Open the iOS workspace to inspect or repair signing manually. No project files are changed by opening Xcode.")
                         }
                     }
-                    Text("Automatic repair restores app-specific export settings, refreshes missing signing material, and points Xcode's Release configuration at it — so Xcode's own \"Automatically manage signing\" no longer disagrees with what this tool builds. It never uploads a build.")
+                    Text("Repair can update export settings, Xcode's Release signing configuration, certificates, and provisioning profiles. Existing project files are backed up. No build is uploaded.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } else {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Add an App Store Connect API key with the App Manager role, then check again.")
+                        Text("Add an App Store Connect API key with the App Manager role to enable automatic repair.")
                             .font(.callout)
                         HStack(spacing: 10) {
-                            Button("Reveal Credential Vault") {
-                                model.revealVault()
+                            Button("Configure Credentials…") {
+                                showStoreConnections = true
                             }
-                            .help("Open ~/.flutter-release in Finder so you can inspect the private App Store Connect credential location. Do not commit this folder to Git.")
+                            .buttonStyle(.borderedProminent)
+                            .help("Open Store credentials to add your App Store Connect API key. Credentials are shared across the managed projects on this Mac; setup will be checked again when you close it.")
                             Button("Open App Store Connect") {
                                 openURL("https://appstoreconnect.apple.com/access/integrations/api")
                             }

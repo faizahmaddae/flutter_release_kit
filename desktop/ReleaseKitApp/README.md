@@ -29,22 +29,53 @@ Settings. Install the current CLI first with:
 frk setup
 ```
 
+## Everyday workflow
+
+- Search managed projects by name, folder, or application ID; combine the search
+  with Android, iOS, or Needs setup filters. Filtering does not change a project.
+- Setup indicators reflect folder availability and signing for every configured
+  platform. Store access is checked separately.
+- Version inputs and build/upload actions come first. Expand **Signing &
+  destination** for identifiers and the Play track; track edits still save
+  immediately. Artifacts, extra build flags, and Screenshot Studio follow below.
+- **Check Setup** runs Doctor; **Analyze & Test** runs Verify. Upload and Android
+  validation retain their confirmation dialogs.
+- Activity opens when a job starts. Toggle it with **⇧⌘L**, or close it without
+  stopping the job. It sits beside the project in wide windows and below it in
+  narrow windows, staying open through resizing and immediate launch failures.
+  Turn off **Follow output** to read earlier log lines. The
+  originating project remains visible even when another project is selected.
+- The CLI path in Settings is a draft until **Save & Reconnect**. **Cancel**
+  and closing the Settings window discard that draft, including when macOS
+  reuses the same Settings window. Store credentials have their own explicit
+  save flow.
+
 ## Safety model
 
 - Projects appear only after explicit onboarding.
+- Switching projects discards pending build-flag and signing-status responses
+  from the previous selection. A delayed read cannot undo newly saved flags.
 - Passwords, API keys, upload keys, and provisioning-profile contents are never
   returned by the machine API or stored by the app.
 - Builds and releases stream through the external `frk` process and can be
   cancelled from the Activity panel.
+- The current CLI stops the process group on cancellation, including a store
+  check's Fastlane helpers, and bounds cleanup when a tool ignores termination.
 - Android upload is restricted to testing tracks. iOS upload is restricted to
   TestFlight. There is no production-publish action.
 - Store release uploads require an explicit confirmation in the app. Android
   validation also requires confirmation because it sends the AAB to Google
   Play's validation API, although it creates no track release.
+- Each **Fix Setup** button opens the Setup Assistant for that platform. Local
+  checks refresh in place; **Run Full Check** checks both platforms and store
+  access in Activity. Missing iOS API credentials can be configured directly
+  through the existing Store credentials screen.
 - The Setup Assistant checks Android in build order: `key.properties`, the
   referenced keystore, all signing credentials, Gradle wiring, and Git safety.
   Vault linking is recommended management, not a false prerequisite for a
-  valid local release build. An imported source is preserved and validated.
+  valid local release build, and stays under an optional disclosure when the
+  local key is valid. An imported source is preserved and validated. Cancelling
+  a file picker preserves the current selection.
 - iOS is treated as a signing chain rather than a single file: Xcode bundle/team,
   Distribution certificate plus private key, decoded app profile, certificate
   compatibility, expiry, and ExportOptions are checked separately.

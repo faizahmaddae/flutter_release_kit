@@ -14,6 +14,7 @@ struct SectionCard<Content: View>: View {
 
     var body: some View {
         content
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(18)
             .background(.background, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             .overlay {
@@ -100,16 +101,30 @@ struct EmptySelectionView: View {
     @EnvironmentObject private var model: AppModel
 
     var body: some View {
-        ContentUnavailableView {
-            Label("No Project Selected", systemImage: "shippingbox")
-        } description: {
-            Text("Add a Flutter project or choose one from the sidebar.")
-        } actions: {
-            Button("Add Project…") {
-                model.showAddProject = true
+        if model.isLoading {
+            ProgressView("Connecting to Release Kit…")
+        } else if !model.isConnected {
+            ContentUnavailableView {
+                Label("Connect to Release Kit", systemImage: "cable.connector")
+            } description: {
+                Text("Check the FRK executable in Settings to load your managed projects.")
+            } actions: {
+                Button("Open Settings") { model.showSettings = true }
+                    .buttonStyle(.borderedProminent)
+                Button("Retry Connection") { Task { await model.bootstrap() } }
             }
-            .buttonStyle(.borderedProminent)
-            .help("Choose one Flutter project to add to FRK. No folders are scanned automatically.")
+        } else {
+            ContentUnavailableView {
+                Label("No Project Selected", systemImage: "shippingbox")
+            } description: {
+                Text("Add a Flutter project or choose one from the sidebar.")
+            } actions: {
+                Button("Add Project…") {
+                    model.showAddProject = true
+                }
+                .buttonStyle(.borderedProminent)
+                .help("Choose one Flutter project to add to FRK. No folders are scanned automatically.")
+            }
         }
     }
 }

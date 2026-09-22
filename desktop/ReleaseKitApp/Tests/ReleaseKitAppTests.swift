@@ -1798,6 +1798,38 @@ final class ReleaseKitAppTests: XCTestCase {
         XCTAssertEqual(credentials.protocolVersion, 1)
     }
 
+    func testClientSavesLeadingDashBuildFlagsThroughTheRealCLI() async throws {
+        let home = try XCTUnwrap(Self.sandboxHome)
+        let project = home.appendingPathComponent("argument-roundtrip")
+        let fastlane = project.appendingPathComponent("fastlane")
+        try FileManager.default.createDirectory(at: fastlane, withIntermediateDirectories: true)
+        let registry = home.appendingPathComponent("projects.json")
+        let previousRegistry = try? Data(contentsOf: registry)
+        defer {
+            if let previousRegistry {
+                try? previousRegistry.write(to: registry)
+            } else {
+                try? FileManager.default.removeItem(at: registry)
+            }
+            try? FileManager.default.removeItem(at: project)
+        }
+        try "name: argument-roundtrip\nplatforms: [android]\nandroid:\n  track: internal\n"
+            .write(to: fastlane.appendingPathComponent("release_kit.yml"), atomically: true, encoding: .utf8)
+        let data = try JSONSerialization.data(withJSONObject: [
+            "version": 1,
+            "projects": [["name": "argument-roundtrip", "path": project.path, "platforms": ["android"]]]
+        ])
+        try data.write(to: registry)
+        let client = FRKClient(executableURL: Self.realCLIURL())
+        let flags = ["--dart-define=A=1", "--verbose", "--flavor", "demo", "--dart-define=NAME=با فاصله"]
+        let saved = try await client.setBuildArgs("argument-roundtrip", platform: .android, args: flags)
+        XCTAssertEqual(flags, saved.android.own)
+        let reloaded = try await client.buildArgs("argument-roundtrip")
+        XCTAssertEqual(flags, reloaded.android.effective)
+        let cleared = try await client.setBuildArgs("argument-roundtrip", platform: .android, args: [])
+        XCTAssertTrue(cleared.android.own.isEmpty)
+    }
+
     func testClientDecodesJSONWhenTheCLIAlsoWritesAWarningToStderr() async throws {
         // Regression: stdout and stderr shared one pipe, so a single warning from a
         // shell rc file or a Ruby gem was interleaved into a one-shot `api` document
@@ -1862,6 +1894,37 @@ final class ReleaseKitAppTests: XCTestCase {
     }
 
     private static let capabilitiesDocumentJSON = #"{"protocolVersion":1,"cliVersion":"0.7.0","minimumDesktopProtocol":1,"maximumDesktopProtocol":1,"capabilities":{"projectDiscovery":true,"streamingEvents":true,"credentialManagement":true,"productionRelease":false,"platforms":["android","ios"],"actions":["build"]}}"#
+
+    @MainActor
+    func testClientTreatsATerminatedStoreQueryAsCancellationInsteadOfAnAPIError() async throws {
+        let stub = try Self.stubCLI("""
+        #!/usr/bin/env python3
+        import json, signal, sys, time
+        from pathlib import Path
+        def cancel(signum, frame):
+            print(json.dumps({"protocolVersion": 1, "cliVersion": "0.8.1", "error": {
+                "code": "store_query_cancelled", "message": "Store check cancelled"
+            }}), flush=True)
+            sys.exit(143)
+        signal.signal(signal.SIGTERM, cancel)
+        Path(__file__).with_name("ready").touch()
+        while True:
+            time.sleep(0.05)
+        """)
+        defer { try? FileManager.default.removeItem(at: stub.deletingLastPathComponent()) }
+        let ready = stub.deletingLastPathComponent().appendingPathComponent("ready")
+        let client = FRKClient(executableURL: stub)
+        let task = Task { _ = try await client.storeVersions("fixture") }
+        defer { task.cancel() }
+        try await Self.settle(while: { !FileManager.default.fileExists(atPath: ready.path) })
+        task.cancel()
+        do {
+            try await task.value
+            XCTFail("A cancelled query must not complete successfully")
+        } catch is CancellationError {
+            // The CLI's diagnostic and exit status must not hide Task cancellation.
+        }
+    }
 
     private static func stubCLI(_ script: String) throws -> URL {
         let root = FileManager.default.temporaryDirectory
@@ -2077,6 +2140,9 @@ final class ReleaseKitAppTests: XCTestCase {
 
         model.start(FRKRunRequest(action: .status))
         XCTAssertTrue(model.isRunning)
+        let acceptedRun = try XCTUnwrap(model.activityRunID)
+        model.start(FRKRunRequest(action: .status))
+        XCTAssertEqual(model.activityRunID, acceptedRun, "A rejected duplicate must not reopen activity.")
 
         let deadline = Date().addingTimeInterval(30)
         while model.isRunning, Date() < deadline {
@@ -2228,8 +2294,137 @@ final class ReleaseKitAppTests: XCTestCase {
         XCTAssertEqual(WorkspaceLayoutMode(width: 680), .focused)
         XCTAssertEqual(WorkspaceLayoutMode(width: 899), .focused)
         XCTAssertEqual(WorkspaceLayoutMode(width: 900), .standard)
-        XCTAssertEqual(WorkspaceLayoutMode(width: 979), .standard)
-        XCTAssertEqual(WorkspaceLayoutMode(width: 980), .expanded)
+        XCTAssertEqual(WorkspaceLayoutMode(width: 1179), .standard)
+        XCTAssertEqual(WorkspaceLayoutMode(width: 1180), .expanded)
+    }
+
+    func testVisibleActivitySurvivesResizingInBothDirections() {
+        var presentation = ActivityPresentationState()
+        presentation.isVisible = true
+        XCTAssertTrue(presentation.showsSidebar)
+        presentation.layoutMode = .focused
+        XCTAssertTrue(presentation.showsCompactPanel)
+        XCTAssertFalse(presentation.showsSidebar)
+        presentation.layoutMode = .standard
+        XCTAssertTrue(presentation.showsCompactPanel)
+        presentation.layoutMode = .expanded
+        XCTAssertTrue(presentation.showsSidebar)
+        XCTAssertFalse(presentation.showsCompactPanel)
+    }
+
+    func testDismissedActivityStaysHiddenAfterResizing() {
+        var presentation = ActivityPresentationState()
+        presentation.layoutMode = .focused
+        presentation.isVisible = true
+        presentation.isVisible = false
+        presentation.layoutMode = .expanded
+        XCTAssertFalse(presentation.showsSidebar)
+        presentation.layoutMode = .standard
+        XCTAssertFalse(presentation.showsCompactPanel)
+    }
+
+    @MainActor
+    func testSettingsDraftCleanupTracksOnlyItsOwnWindow() {
+        _ = NSApplication.shared
+        let settingsWindow = NSWindow()
+        let unrelatedWindow = NSWindow()
+        settingsWindow.isReleasedWhenClosed = false
+        unrelatedWindow.isReleasedWhenClosed = false
+        let observer = SettingsWindowCloseObserver.ObserverView()
+        var discardedDrafts = 0
+        observer.onClose = { discardedDrafts += 1 }
+        settingsWindow.contentView = observer
+
+        unrelatedWindow.close()
+        XCTAssertEqual(discardedDrafts, 0, "Closing another window must preserve the current draft.")
+        settingsWindow.close()
+        XCTAssertEqual(discardedDrafts, 1, "The retained Settings scene must discard its draft on close.")
+
+        settingsWindow.contentView = nil
+        NotificationCenter.default.post(name: NSWindow.willCloseNotification, object: settingsWindow)
+        XCTAssertEqual(discardedDrafts, 1, "A detached view must stop observing its former window.")
+    }
+
+    @MainActor
+    func testEachImmediateLaunchFailureLeavesAnObservableActivityRun() throws {
+        let model = AppModel(clientFactory: { _ in FakeFRKClient() })
+        model.cliPath = "/nonexistent/frk-\(UUID().uuidString)"
+        XCTAssertNil(model.activityRunID)
+        model.start(FRKRunRequest(action: .status))
+        XCTAssertFalse(model.isRunning)
+        XCTAssertEqual(model.lastRunOutcome, .failure)
+        let firstRun = try XCTUnwrap(model.activityRunID)
+        model.clearActivity()
+        XCTAssertEqual(model.activityRunID, firstRun, "Clearing output must not reopen activity.")
+        model.start(FRKRunRequest(action: .status))
+        XCTAssertNotEqual(try XCTUnwrap(model.activityRunID), firstRun)
+        XCTAssertFalse(model.isRunning)
+        XCTAssertEqual(model.activity.last?.kind, .error)
+    }
+
+    func testProjectSearchMatchesNamesFoldersAndApplicationIDs() {
+        let project = Self.projectSummary(id: "sample", name: "Café Demo")
+        XCTAssertTrue(ProjectBrowserFilter.all.includes(project, query: "  CAFE  "))
+        XCTAssertTrue(ProjectBrowserFilter.all.includes(project, query: "/tmp/sample"))
+        XCTAssertTrue(ProjectBrowserFilter.all.includes(project, query: "ORG.EXAMPLE.SAMPLE"))
+        XCTAssertTrue(ProjectBrowserFilter.all.includes(project, query: "demo org.example"))
+        XCTAssertFalse(ProjectBrowserFilter.all.includes(project, query: "demo unknown"))
+        XCTAssertTrue(ProjectBrowserFilter.all.includes(project, query: " \n "))
+        let ios = Self.iosProject(signingReady: true, profileReady: true)
+        XCTAssertTrue(ProjectBrowserFilter.all.includes(ios, query: "org.example.app"))
+    }
+
+    func testProjectFiltersCombinePlatformAndSearch() {
+        let project = Self.projectSummary(id: "sample", name: "Demo")
+        XCTAssertTrue(ProjectBrowserFilter.android.includes(project, query: "demo"))
+        XCTAssertFalse(ProjectBrowserFilter.ios.includes(project, query: "demo"))
+        XCTAssertFalse(ProjectBrowserFilter.android.includes(project, query: "unknown"))
+        XCTAssertFalse(ProjectBrowserFilter.needsSetup.includes(project, query: "demo"))
+    }
+
+    func testProjectSetupStatusIncludesEveryConfiguredPlatform() {
+        let project = Self.projectSummary(id: "sample", name: "Demo", platforms: [.android, .ios])
+        XCTAssertTrue(project.isReady) // Registry membership is not signing readiness.
+        XCTAssertTrue(project.needsSetup)
+        XCTAssertEqual(project.setupLabel, "Signing required")
+        XCTAssertTrue(ProjectBrowserFilter.needsSetup.includes(project, query: "demo"))
+        let signed = Self.projectSummary(id: "sample", name: "Demo")
+        XCTAssertFalse(signed.needsSetup)
+        XCTAssertEqual(signed.setupLabel, "Signing ready")
+    }
+
+    func testProjectSetupStatusPreservesLegacyIOSReadiness() {
+        XCTAssertFalse(Self.iosProject(signingReady: nil, profileReady: true).needsSetup)
+        XCTAssertTrue(Self.iosProject(signingReady: false, profileReady: true).needsSetup)
+        XCTAssertTrue(Self.iosProject(signingReady: nil, profileReady: false).needsSetup)
+    }
+
+    func testMissingAndUnconfiguredProjectsNeverShowAsReady() {
+        let missing = Self.projectSummary(id: "missing", name: "Missing", exists: false)
+        XCTAssertTrue(missing.needsSetup)
+        XCTAssertEqual(missing.setupLabel, "Folder missing")
+        let unconfigured = Self.projectSummary(id: "new", name: "New", onboarded: false)
+        XCTAssertTrue(unconfigured.needsSetup)
+        XCTAssertEqual(unconfigured.setupLabel, "Setup required")
+        XCTAssertTrue(Self.projectSummary(id: "empty", name: "Empty", platforms: []).needsSetup)
+    }
+
+    @MainActor
+    func testActivityKeepsItsProjectContextWhenSelectionChanges() async throws {
+        let fake = FakeFRKClient(projectsResponse: Self.projectsResponse([
+            Self.projectSummary(id: "first", name: "First App"),
+            Self.projectSummary(id: "second", name: "Second App"),
+        ]))
+        let model = AppModel(clientFactory: { _ in fake })
+        try await model.reloadProjects()
+        // A missing executable fails locally; no build or store request is made.
+        model.cliPath = "/nonexistent/frk-\(UUID().uuidString)"
+        model.start(FRKRunRequest(action: .build, project: "first", platform: .android))
+        XCTAssertEqual(model.activityContext, "First App · Android")
+        model.selectedProjectID = "second"
+        XCTAssertEqual(model.activityContext, "First App · Android")
+        model.clearActivity()
+        XCTAssertNil(model.activityContext)
     }
 
     func testEveryProjectFieldTheAppDecodesIsEmittedByTheCLI() throws {
@@ -3264,8 +3459,7 @@ final class ReleaseKitAppTests: XCTestCase {
 
         XCTAssertNil(model.storeVersions)
         XCTAssertEqual(model.storeCheckNote?.contains("cancelled") ?? false, true)
-        // The lane keeps querying after `frk` is killed, so an instant retry would put
-        // two lanes on the stores.
+        // Keep a brief debounce, including compatibility with older protocol-v1 CLIs.
         XCTAssertTrue(model.isStoreCheckCoolingDown)
         XCTAssertFalse(model.canCheckStoreVersions)
 
@@ -3611,6 +3805,162 @@ final class ReleaseKitAppTests: XCTestCase {
         XCTAssertEqual(model.releaseLegs.last?.summary, "Not started, because an earlier platform did not finish")
     }
 
+    @MainActor
+    func testTasksFromAnOldViewCannotStartRequestsForTheNewSelection() async {
+        let fake = FakeFRKClient()
+        let model = AppModel(clientFactory: { _ in fake })
+        model.selectedProjectID = "banana"
+        await model.loadBuildArgs(for: "apple")
+        await model.setBuildArgs(for: "apple", platform: .android, args: ["--old"])
+        await model.loadSetupStatus(for: "apple")
+        XCTAssertTrue(fake.buildArgsCalls.recorded.isEmpty)
+        XCTAssertTrue(fake.setBuildArgsCalls.recorded.isEmpty)
+        XCTAssertTrue(fake.setupStatusCalls.recorded.isEmpty)
+        XCTAssertNil(model.buildArgsError)
+        XCTAssertNil(model.errorMessage)
+    }
+
+    @MainActor
+    func testLateBuildArgsResponseCannotReplaceTheNewProjectsFlags() async throws {
+        let gate = ResponseGate()
+        var fake = FakeFRKClient(projectsResponse: Self.projectsResponse([
+            Self.projectSummary(id: "apple", name: "apple"),
+            Self.projectSummary(id: "banana", name: "banana")
+        ]))
+        fake.buildArgsGate = gate
+        fake.buildArgsResponse = Self.buildArgsResponse(android: Self.platformBuildArgs(own: ["--old"]))
+        let calls = fake.buildArgsCalls
+        let model = AppModel(clientFactory: { _ in fake })
+        try await model.reloadProjects()
+        let pending = Task { await model.loadBuildArgs(for: "apple") }
+        try await Self.settle(while: { calls.recorded.isEmpty })
+        model.selectedProjectID = "banana"
+        fake.buildArgsGate = nil
+        fake.buildArgsResponse = Self.buildArgsResponse(android: Self.platformBuildArgs(own: ["--current"]))
+        await model.loadBuildArgs(for: "banana")
+        await gate.open()
+        await pending.value
+        XCTAssertEqual(["--current"], model.buildArgs?.android.own)
+        XCTAssertNil(model.buildArgsError)
+        XCTAssertFalse(model.isLoadingBuildArgs)
+    }
+
+    @MainActor
+    func testLateBuildArgsFailureCannotClearTheNewProjectsFlags() async throws {
+        let gate = ResponseGate()
+        var fake = FakeFRKClient(projectsResponse: Self.projectsResponse([
+            Self.projectSummary(id: "apple", name: "apple"),
+            Self.projectSummary(id: "banana", name: "banana")
+        ]))
+        fake.buildArgsGate = gate
+        let calls = fake.buildArgsCalls
+        let model = AppModel(clientFactory: { _ in fake })
+        try await model.reloadProjects()
+        let pending = Task { await model.loadBuildArgs(for: "apple") }
+        try await Self.settle(while: { calls.recorded.isEmpty })
+        model.selectedProjectID = "banana"
+        fake.buildArgsGate = nil
+        fake.buildArgsResponse = Self.buildArgsResponse(android: Self.platformBuildArgs(own: ["--current"]))
+        await model.loadBuildArgs(for: "banana")
+        await gate.open()
+        await pending.value
+        XCTAssertEqual(["--current"], model.buildArgs?.android.own)
+        XCTAssertNil(model.buildArgsError)
+    }
+
+    @MainActor
+    func testReadStartedBeforeSaveCannotRestoreOldFlags() async throws {
+        let gate = ResponseGate()
+        var fake = FakeFRKClient()
+        fake.buildArgsGate = gate
+        fake.buildArgsResponse = Self.buildArgsResponse(android: Self.platformBuildArgs(own: ["--old"]))
+        fake.setBuildArgsResponse = Self.buildArgsResponse(android: Self.platformBuildArgs(own: ["--saved"]))
+        let model = AppModel(clientFactory: { _ in fake })
+        let pending = Task { await model.loadBuildArgs(for: "apple") }
+        try await Self.settle(while: { fake.buildArgsCalls.recorded.isEmpty })
+        await model.setBuildArgs(for: "apple", platform: .android, args: ["--saved"])
+        await gate.open()
+        await pending.value
+        XCTAssertEqual(["--saved"], model.buildArgs?.android.own)
+        XCTAssertFalse(model.isLoadingBuildArgs)
+        XCTAssertFalse(model.isSavingBuildArgs)
+    }
+
+    @MainActor
+    func testLateSaveCannotPopulateAnotherProjectsFlags() async throws {
+        let gate = ResponseGate()
+        var fake = FakeFRKClient()
+        fake.setBuildArgsGate = gate
+        fake.setBuildArgsResponse = Self.buildArgsResponse(android: Self.platformBuildArgs(own: ["--saved"]))
+        let model = AppModel(clientFactory: { _ in fake })
+        model.selectedProjectID = "apple"
+        let pending = Task { await model.setBuildArgs(for: "apple", platform: .android, args: ["--saved"]) }
+        try await Self.settle(while: { fake.setBuildArgsCalls.recorded.isEmpty })
+        model.selectedProjectID = "banana"
+        await gate.open()
+        await pending.value
+        XCTAssertNil(model.buildArgs)
+        XCTAssertNil(model.buildArgsError)
+        XCTAssertFalse(model.isSavingBuildArgs)
+    }
+
+    @MainActor
+    func testDismissedSetupIgnoresAnInFlightResponse() async throws {
+        let gate = ResponseGate()
+        var fake = FakeFRKClient(setupStatusResponse: Self.setupStatusResponse(projectId: "apple"))
+        fake.setupStatusGate = gate
+        let model = AppModel(clientFactory: { _ in fake })
+        let pending = Task { await model.loadSetupStatus(for: "apple") }
+        try await Self.settle(while: { fake.setupStatusCalls.recorded.isEmpty })
+        model.clearSetupStatus()
+        await gate.open()
+        await pending.value
+        XCTAssertNil(model.setupStatus)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertFalse(model.isLoadingSetup)
+    }
+
+    @MainActor
+    func testOlderReadCannotStopTheCurrentLoadingIndicator() async throws {
+        let firstGate = ResponseGate()
+        let secondGate = ResponseGate()
+        var fake = FakeFRKClient()
+        fake.buildArgsGate = firstGate
+        fake.buildArgsResponse = Self.buildArgsResponse()
+        let calls = fake.buildArgsCalls
+        let model = AppModel(clientFactory: { _ in fake })
+        let first = Task { await model.loadBuildArgs(for: "apple") }
+        try await Self.settle(while: { calls.recorded.count < 1 })
+        fake.buildArgsGate = secondGate
+        let second = Task { await model.loadBuildArgs(for: "apple") }
+        try await Self.settle(while: { calls.recorded.count < 2 })
+        await firstGate.open()
+        await first.value
+        XCTAssertTrue(model.isLoadingBuildArgs)
+        XCTAssertNil(model.buildArgs)
+        await secondGate.open()
+        await second.value
+        XCTAssertFalse(model.isLoadingBuildArgs)
+        XCTAssertNotNil(model.buildArgs)
+    }
+
+    /// Explicit release keeps response ordering deterministic without timing races.
+    private actor ResponseGate {
+        private var isOpen = false
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+
+        func wait() async {
+            guard !isOpen else { return }
+            await withCheckedContinuation { waiters.append($0) }
+        }
+
+        func open() {
+            isOpen = true
+            for waiter in waiters { waiter.resume() }
+            waiters.removeAll()
+        }
+    }
+
     // Stands in for the CLI so AppModel's error branches can actually run. A nil
     // response means "this call fails", which is how every throwing path is reached.
     private struct FakeFRKClient: FRKClientProtocol {
@@ -3627,6 +3977,10 @@ final class ReleaseKitAppTests: XCTestCase {
         var storeVersionsDelaySeconds: Double = 0
         /// Counts store queries so a test can prove one never happened.
         var storeVersionsCalls = CallCounter()
+        var buildArgsGate: ResponseGate?
+        var setBuildArgsGate: ResponseGate?
+        var setupStatusGate: ResponseGate?
+        var setupStatusCalls = CallCounter()
         var buildArgsResponse: BuildArgsResponse?
         var setBuildArgsResponse: BuildArgsResponse?
         var buildArgsCalls = CallCounter()
@@ -3651,11 +4005,13 @@ final class ReleaseKitAppTests: XCTestCase {
 
         func buildArgs(_ id: String) async throws -> BuildArgsResponse {
             buildArgsCalls.record(id)
+            await buildArgsGate?.wait()
             return try Self.unwrap(buildArgsResponse)
         }
 
         func setBuildArgs(_ id: String, platform: PlatformKind, args: [String]) async throws -> BuildArgsResponse {
             setBuildArgsCalls.record("\(id)/\(platform.rawValue)/\(args.joined(separator: "|"))")
+            await setBuildArgsGate?.wait()
             return try Self.unwrap(setBuildArgsResponse)
         }
 
@@ -3669,7 +4025,9 @@ final class ReleaseKitAppTests: XCTestCase {
         }
 
         func setupStatus(_ id: String) async throws -> SetupStatusResponse {
-            try Self.unwrap(setupStatusResponse)
+            setupStatusCalls.record(id)
+            await setupStatusGate?.wait()
+            return try Self.unwrap(setupStatusResponse)
         }
 
         func credentials() async throws -> CredentialsResponse {
@@ -3755,14 +4113,16 @@ final class ReleaseKitAppTests: XCTestCase {
         buildName: String? = nil,
         buildNumber: Int? = nil,
         platforms: [PlatformKind] = [.android],
-        track: String = "internal"
+        track: String = "internal",
+        exists: Bool = true,
+        onboarded: Bool = true
     ) -> ProjectSummary {
         ProjectSummary(
             id: id,
             name: name,
             path: "/tmp/\(id)",
-            exists: true,
-            onboarded: true,
+            exists: exists,
+            onboarded: onboarded,
             state: "ready",
             platforms: platforms,
             version: buildNumber.map { "\(buildName ?? "")+\($0)" },

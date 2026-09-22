@@ -2,7 +2,7 @@
 # ruff and the Python 3.9 floor, which need tools this file does not assume.
 
 .DEFAULT_GOAL := check
-.PHONY: test desktop check
+.PHONY: test desktop mcp check
 
 test:
 	python3 -m py_compile bin/frk
@@ -15,5 +15,8 @@ test:
 
 desktop:
 	swift test --package-path desktop/ReleaseKitApp
+
+mcp:
+	uv run --project integrations/mcp --locked python -m unittest discover -s integrations/mcp/tests -v
 
 check: test desktop

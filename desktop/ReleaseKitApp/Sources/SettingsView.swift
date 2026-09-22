@@ -1,9 +1,11 @@
+import AppKit
 import SwiftUI
 
 struct SettingsView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     @State private var showStoreConnections = false
+    @State private var cliPathDraft = ""
 
     var body: some View {
         VStack(spacing: 0) {
@@ -60,12 +62,12 @@ struct SettingsView: View {
                 Section("CLI and private storage") {
                     LabeledContent("FRK executable") {
                         HStack {
-                            TextField("/path/to/frk", text: $model.cliPath)
+                            TextField("/path/to/frk", text: $cliPathDraft)
                                 .textFieldStyle(.roundedBorder)
                                 .labelsHidden()
-                                .help("Executable used by the desktop app for every operation. Current value: \(model.cliPath)")
+                                .help("Executable used after Save & Reconnect. Cancel discards changes to this field.")
                             Button("Choose…") {
-                                model.selectCLI()
+                                chooseCLI()
                             }
                             .help("Select an installed frk executable. The new path is used after Save & Reconnect.")
                         }
@@ -109,21 +111,37 @@ struct SettingsView: View {
             HStack {
                 Spacer()
                 Button("Cancel", role: .cancel) {
+                    cliPathDraft = model.cliPath
                     dismiss()
                 }
                 Button("Save & Reconnect") {
+                    model.cliPath = cliPathDraft.trimmingCharacters(in: .whitespacesAndNewlines)
                     model.reconnect()
                     dismiss()
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(model.isRunning || model.cliPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(model.isRunning || cliPathDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 .help("Save the selected CLI path, reconnect, and reload capabilities, credentials, and managed projects. No build or upload runs.")
             }
             .padding(18)
         }
+        .onAppear { cliPathDraft = model.cliPath }
+        .background(SettingsWindowCloseObserver { cliPathDraft = model.cliPath })
         .sheet(isPresented: $showStoreConnections) {
             StoreConnectionsView(presentation: .settings)
                 .environmentObject(model)
+        }
+    }
+
+    private func chooseCLI() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose the frk executable"
+        panel.prompt = "Choose"
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let url = panel.url {
+            cliPathDraft = url.path
         }
     }
 
@@ -151,5 +169,40 @@ struct SettingsView: View {
         .help(isConnected
               ? "A credential is configured locally for this store. Per-app permissions are verified later by Doctor, Validate, or Release."
               : "No shared credential is configured for this store. Local builds still work, but its upload actions remain unavailable.")
+    }
+}
+
+/// macOS retains the Settings scene when its window closes, so onAppear alone
+/// cannot discard a draft when that same scene is reopened.
+struct SettingsWindowCloseObserver: NSViewRepresentable {
+    let onClose: () -> Void
+
+    func makeNSView(context: Context) -> ObserverView {
+        let view = ObserverView()
+        view.onClose = onClose
+        return view
+    }
+
+    func updateNSView(_ view: ObserverView, context: Context) {
+        view.onClose = onClose
+    }
+
+    final class ObserverView: NSView {
+        var onClose: () -> Void = {}
+        private var observer: NSObjectProtocol?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if let observer { NotificationCenter.default.removeObserver(observer) }
+            observer = nil
+            guard let window else { return }
+            observer = NotificationCenter.default.addObserver(
+                forName: NSWindow.willCloseNotification, object: window, queue: .main
+            ) { [weak self] _ in self?.onClose() }
+        }
+
+        deinit {
+            if let observer { NotificationCenter.default.removeObserver(observer) }
+        }
     }
 }

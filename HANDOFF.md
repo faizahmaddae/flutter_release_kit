@@ -32,6 +32,8 @@ The only store-asset feature wanted now is **Screenshot Studio**:
 - `bin/frk`: standard-library-only Python CLI and versioned machine API.
 - `fastlane/Fastfile`: single source of build, validation, and tester-release behavior.
 - `desktop/ReleaseKitApp`: SwiftUI client; release logic remains in the CLI.
+- `integrations/mcp`: optional local stdio MCP client of the same machine API.
+  SDK dependencies stay isolated; setup and client configuration are in `docs/MCP.md`.
 - Secrets/signing material live under `~/.flutter-release`, never in Git or API
   responses.
 - Versions never auto-increment.
@@ -43,6 +45,7 @@ The only store-asset feature wanted now is **Screenshot Studio**:
 
 Run `frk --version` for the current CLI version. Machine protocol is v1. Relevant files:
 
+- `integrations/mcp/frk_mcp.py` (AI tools, session jobs, private output, cancellation)
 - `desktop/ReleaseKitApp/Sources/ScreenshotStudioView.swift`
 - `desktop/ReleaseKitApp/Sources/ScreenshotCaptureService.swift`
 - `desktop/ReleaseKitApp/Sources/ScreenshotRenderer.swift`
@@ -64,6 +67,9 @@ ruby -c fastlane/Fastfile
 python3 -m py_compile bin/frk
 python3 -m unittest tests.test_frk
 git diff --check
+
+# When changing the optional MCP adapter (requires uv; all jobs are simulated)
+make mcp
 
 # desktop/ReleaseKitApp
 swift test

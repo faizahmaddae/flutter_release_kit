@@ -13,6 +13,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var isLoading = false
     @Published private(set) var isRunning = false
     @Published private(set) var runningTitle: String?
+    @Published private(set) var activityContext: String?
+    @Published private(set) var activityRunID: UUID?
     @Published private(set) var activity: [ActivityLine] = []
     @Published private(set) var lastRunOutcome: RunOutcome?
     // fastlane marks the one line in a failure that is meant for a human — the
@@ -79,10 +81,11 @@ final class AppModel: ObservableObject {
     // starting a newer check bumps it, so a cancelled query that settles afterwards
     // cannot write its outcome over the state that replaced it.
     private var storeCheckToken = 0
-    // How long "Check stores" stays disabled after a cancellation. `frk api
-    // store-versions` starts fastlane in its own session, so killing `frk` returns
-    // control immediately but leaves the lane querying the stores; retrying at once
-    // would put two lanes on the stores. Settable so tests do not have to wait.
+    private var setupRequestToken = 0
+    private var buildArgsRequestToken = 0
+    // Briefly debounce repeated store requests. This also remains useful with
+    // older protocol-v1 CLIs, which did not stop the query on cancellation.
+    // Settable so tests do not have to wait.
     var storeCheckRetryDelaySeconds: Double = 3
     private var queuedRequests: [FRKRunRequest] = []
     private var lineBuffer = NDJSONLineBuffer()
@@ -202,18 +205,6 @@ final class AppModel: ObservableObject {
         Task { await bootstrap() }
     }
 
-    func selectCLI() {
-        let panel = NSOpenPanel()
-        panel.title = "Choose the frk executable"
-        panel.prompt = "Choose"
-        panel.canChooseDirectories = false
-        panel.canChooseFiles = true
-        panel.allowsMultipleSelection = false
-        if panel.runModal() == .OK, let url = panel.url {
-            cliPath = url.path
-        }
-    }
-
     func revealVault() {
         let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".flutter-release")
         NSWorkspace.shared.open(url)
@@ -265,10 +256,14 @@ final class AppModel: ObservableObject {
     }
 
     func loadSetupStatus(for projectID: String) async {
+        guard selectedProjectID == nil || selectedProjectID == projectID else { return }
+        setupRequestToken += 1
+        let token = setupRequestToken
         isLoadingSetup = true
-        defer { isLoadingSetup = false }
+        defer { if setupRequestToken == token { isLoadingSetup = false } }
         do {
             let response = try await client.setupStatus(projectID)
+            guard setupRequestToken == token, !Task.isCancelled else { return }
             if let error = response.error {
                 setupStatus = nil
                 errorMessage = error.message
@@ -276,12 +271,14 @@ final class AppModel: ObservableObject {
                 setupStatus = response
             }
         } catch {
+            guard setupRequestToken == token, !Task.isCancelled else { return }
             setupStatus = nil
             errorMessage = error.localizedDescription
         }
     }
 
     func clearSetupStatus() {
+        setupRequestToken += 1
         setupStatus = nil
         isLoadingSetup = false
     }
@@ -327,7 +324,7 @@ final class AppModel: ObservableObject {
                 }
             } catch is CancellationError {
                 guard self.storeCheckToken == token else { return }
-                self.storeCheckNote = "Store check cancelled. The store query keeps running on its own for up to a minute, so give it a moment before checking again."
+                self.storeCheckNote = "Store check cancelled. You can check again in a moment."
                 self.beginStoreCheckCooldown()
             } catch {
                 guard self.storeCheckToken == token else { return }
@@ -348,12 +345,20 @@ final class AppModel: ObservableObject {
     /// call on every selection: local and instant, and the CLI never writes anything
     /// to answer it.
     func loadBuildArgs(for projectID: String) async {
+        // A save already in flight is the authoritative next state. A view reload
+        // must not overtake it with a read of the file before the write completes.
+        guard !isSavingBuildArgs, selectedProjectID == nil || selectedProjectID == projectID else { return }
+        buildArgsRequestToken += 1
+        let token = buildArgsRequestToken
         isLoadingBuildArgs = true
         buildArgsError = nil
-        defer { isLoadingBuildArgs = false }
+        defer { if buildArgsRequestToken == token { isLoadingBuildArgs = false } }
         do {
-            buildArgs = try await client.buildArgs(projectID)
+            let response = try await client.buildArgs(projectID)
+            guard buildArgsRequestToken == token, !Task.isCancelled else { return }
+            buildArgs = response
         } catch {
+            guard buildArgsRequestToken == token, !Task.isCancelled else { return }
             buildArgs = nil
             buildArgsError = error.localizedDescription
         }
@@ -363,12 +368,19 @@ final class AppModel: ObservableObject {
     /// response, so `own`/`effective` reflect exactly what was just written rather than
     /// what the caller assumed would happen.
     func setBuildArgs(for projectID: String, platform: PlatformKind, args: [String]) async {
+        guard !isSavingBuildArgs, selectedProjectID == nil || selectedProjectID == projectID else { return }
+        buildArgsRequestToken += 1
+        let token = buildArgsRequestToken
+        isLoadingBuildArgs = false
         isSavingBuildArgs = true
         buildArgsError = nil
-        defer { isSavingBuildArgs = false }
+        defer { if buildArgsRequestToken == token { isSavingBuildArgs = false } }
         do {
-            buildArgs = try await client.setBuildArgs(projectID, platform: platform, args: args)
+            let response = try await client.setBuildArgs(projectID, platform: platform, args: args)
+            guard buildArgsRequestToken == token, !Task.isCancelled else { return }
+            buildArgs = response
         } catch {
+            guard buildArgsRequestToken == token, !Task.isCancelled else { return }
             buildArgsError = error.localizedDescription
         }
     }
@@ -513,6 +525,9 @@ final class AppModel: ObservableObject {
         cancellationRequested = false
         isRunning = true
         runningTitle = request.action.title
+        let projectName = projects.first(where: { $0.id == request.project })?.name ?? request.project
+        activityContext = [projectName, request.platform?.title].compactMap { $0 }.joined(separator: " · ")
+        activityRunID = UUID()
         selectionAfterRunPath = request.action == .onboard && !request.dryRun ? request.project : nil
 
         let pipe = Pipe()
@@ -661,6 +676,7 @@ final class AppModel: ObservableObject {
     func clearActivity() {
         guard !isRunning else { return }
         activity = []
+        activityContext = nil
         lastRunOutcome = nil
         lastActivityErrorLine = nil
     }
@@ -790,6 +806,7 @@ final class AppModel: ObservableObject {
     /// restores what was last known instead of forcing the user to check again.
     private func projectSelectionChanged() {
         resetStoreCheck()
+        clearSetupStatus()
         releaseLegs = []
         queuedRequests = []
         // Unlike the store report and the toggle below, this is not restored from a
@@ -797,6 +814,9 @@ final class AppModel: ObservableObject {
         // another's for however long the view's own reload takes to land.
         buildArgs = nil
         buildArgsError = nil
+        buildArgsRequestToken += 1
+        isLoadingBuildArgs = false
+        isSavingBuildArgs = false
         if let projectID = selectedProjectID {
             splitVersionName = UserDefaults.standard.bool(forKey: "frkSplitVersionName.\(projectID)")
             if let data = UserDefaults.standard.data(forKey: "frkStoreVersionsCache.\(projectID)"),

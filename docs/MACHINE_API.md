@@ -88,15 +88,17 @@ still answers; only the lane can attribute a timeout to one store.
 Clients should call this behind a spinner and cancel by terminating the `frk`
 process.
 
-Cancellation behaves differently here than in `api run`, and clients need to
-know which one they are using. `api run` installs signal handlers that pass a
-termination on to its child's process group. `store-versions` does **not**:
-fastlane is started in its own session, so killing `frk` returns control to the
-client immediately but leaves the lane running until it finishes its own
-per-store budget. Nothing is at risk — the lane is read-only and its output is
-discarded once nobody is reading it — but a client that cancels and instantly
-retries can have two lanes querying the stores at once. Debounce the retry.
-`frk` reaps the child itself only on its own 300-second timeout.
+The current CLI handles `SIGTERM` and `SIGINT` by cancelling the query and
+stopping its process group before returning. Cleanup allows up to five seconds for a
+graceful stop, then kills remaining helpers and allows up to five seconds to
+reap the child. Repeated cancellation does not interrupt this cleanup. Helpers
+are stopped even if the group's original process has already exited.
+
+Cancellation returns a `store_query_cancelled` error document with exit 143
+for `SIGTERM` or 130 for `SIGINT`. It never returns a partial store report.
+Older protocol-v1 CLIs leave the lane running after cancellation; clients
+supporting those versions should retain a short retry debounce. `SIGKILL`
+cannot be handled and must not be used as the normal cancellation mechanism.
 
 ### Statuses
 
@@ -160,7 +162,8 @@ Parse it as ISO-8601; matching on a trailing `Z` will fail on the fallback.
 ### Failures
 
 Every failure below answers with the standard error envelope described under
-[Errors](#errors) and exits 1. The envelope carries no `android` or `ios` key
+[Errors](#errors). Failures exit 1, except caller cancellation (130 or 143).
+The envelope carries no `android` or `ios` key
 at all, which is the point: a client can never read "the store holds nothing"
 out of a run that never reached a store.
 
@@ -171,6 +174,7 @@ out of a run that never reached a store.
 | `project_not_onboarded` | The project has no shared Fastfile import or release configuration; run `frk onboard` first |
 | `fastlane_unavailable` | fastlane is not on `PATH`, or the child process could not be started |
 | `store_query_timed_out` | The lane did not finish within 300 seconds of being started and was stopped. No store version was read |
+| `store_query_cancelled` | The caller cancelled; the local query was stopped. Exits 130 for `SIGINT` or 143 for `SIGTERM` |
 | `store_query_failed` | The lane produced no report line: fastlane crashed, died early, or the shared Fastfile predates the lane |
 | `store_report_unreadable` | A report line arrived that this CLI cannot read as a JSON object — the lane and the CLI disagree about the format |
 
@@ -195,7 +199,7 @@ complete answer into "could not check". `frk` returns the document and exits 0.
 
 ```bash
 frk api build-args example_app
-frk api set-build-args example_app --platform android --arg "--dart-define=A=1" --arg "--dart-define=B=2"
+frk api set-build-args example_app --platform android --arg="--dart-define=A=1" --arg="--dart-define=B=2"
 frk api set-build-args example_app --platform android
 ```
 
@@ -220,6 +224,16 @@ edit only the one `extra_build_args:` block under `android:`/`ios:` in the
 project's `release_kit.yml`; every other line, including comments and the
 other platform's section, is preserved byte for byte. Local and instant: no
 network, no fastlane, no build.
+
+The editor accepts block lists with blank lines, comments, and quoted or plain
+string items, plus JSON-style inline lists such as `["--flavor", "demo"]`.
+Ambiguous forms (duplicate keys, anchors, nested lists, or multiline items)
+produce a diagnostic before the file is changed. Comments inside an edited
+list are retained, although their position within that block may move.
+Unrelated lines, line endings, file permissions, and symlinks are preserved.
+Concurrent FRK track/build-flag edits are serialized before reading the file;
+each write replaces the complete file atomically. Setting the existing value
+leaves the file and its modification time unchanged.
 
 A platform not in `platforms` reports `"configured": false` with empty lists,
 and `set-build-args` for that platform is `invalid_platform` rather than
@@ -353,11 +367,17 @@ that failure belongs to the underlying command and is reported only by
 `finished.success` and `finished.exitCode`.
 
 There is one exception, and it is not the command failing — it is the stream
-itself failing. If reading the child's output raises (an I/O error, or a signal
-delivered to `frk`), the run emits `error` with code `stream_failed` after
+itself failing. If reading the child's output raises an I/O error, the run
+emits `error` with code `stream_failed` after
 `started`, kills the child's process group, and then emits `finished` with
 `success: false`. So a client must accept an `error` event at any point after
 `started`, not only in place of one.
+
+Caller cancellation (`SIGTERM` or `SIGINT`) stops the command's process group
+with the same bounded cleanup as a store query, then emits exactly one
+`finished` event with `success: false` and exit 143 or 130 respectively.
+It is still cancellation when a child handles the signal and exits 0.
+Stopping local work does not undo an upload a store has already accepted.
 
 ## Errors
 
@@ -377,11 +397,12 @@ whose `code` and `message` are top-level event fields, not a nested object.
 | `invalid_credentials` | `api configure-credentials` | The source file is missing or failed validation, or a different vault copy exists and `--force` was not supplied |
 | `credential_vault_unavailable` | `api configure-credentials` | The chosen file is fine but `~/.flutter-release` could not be written — distinct from `invalid_credentials` so a client can tell "pick another file" from "fix the vault" |
 | `invalid_request` | `api run` | The action and arguments cannot be mapped to a command: a missing project or `--platform`, or `validate` with a non-Android platform |
-| `stream_failed` | `api run` | Reading the child's output raised, or `frk` was signalled. Emitted after `started`; the child's process group is killed and `finished` follows with `success: false` |
+| `stream_failed` | `api run` | Reading or forwarding the child's output raised. Emitted after `started`; the child's process group is killed and `finished` follows with `success: false` |
 | `project_unavailable` | `api store-versions`, `api build-args`, `api set-build-args`, `api set-track` | The registered project directory no longer exists |
 | `project_not_onboarded` | `api store-versions` | The project has no shared Fastfile import or release configuration |
 | `fastlane_unavailable` | `api store-versions` | fastlane is not on `PATH`, or the child process could not be started |
 | `store_query_timed_out` | `api store-versions` | The lane did not finish within 300 seconds of being started and was stopped |
+| `store_query_cancelled` | `api store-versions` | The caller cancelled the query; the local process group was stopped |
 | `store_query_failed` | `api store-versions` | The lane produced no report line |
 | `store_report_unreadable` | `api store-versions` | The report line is not a JSON object |
 | `invalid_platform` | `api set-build-args` | The project does not have the given `--platform` in `platforms` |
@@ -414,6 +435,7 @@ them per command.
 
 Any document command can also exit 70 (`internal_error`) or exit with the
 status a handled diagnostic used (`command_failed`, exit 1 in practice).
+`api store-versions` additionally exits 130 or 143 when the caller cancels it.
 
 `api run` exit 1 therefore has a different meaning from exit 1 anywhere else in
 this API: the request was valid and the underlying action was started, and it

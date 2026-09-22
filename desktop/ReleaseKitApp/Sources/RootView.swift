@@ -9,7 +9,7 @@ enum WorkspaceLayoutMode: Equatable {
     init(width: CGFloat) {
         if width < 900 {
             self = .focused
-        } else if width < 980 {
+        } else if width < 1180 {
             self = .standard
         } else {
             self = .expanded
@@ -17,11 +17,20 @@ enum WorkspaceLayoutMode: Equatable {
     }
 }
 
+/// One visibility choice survives moving activity beside or below the project.
+struct ActivityPresentationState {
+    var layoutMode = WorkspaceLayoutMode.expanded
+    var isVisible = false
+
+    var showsSidebar: Bool { layoutMode == .expanded && isVisible }
+
+    var showsCompactPanel: Bool { layoutMode != .expanded && isVisible }
+}
+
 struct RootView: View {
     @EnvironmentObject private var model: AppModel
     @State private var columnVisibility = NavigationSplitViewVisibility.all
-    @State private var layoutMode = WorkspaceLayoutMode.expanded
-    @State private var showCompactActivity = false
+    @State private var activityPresentation = ActivityPresentationState()
 
     private var errorPresented: Binding<Bool> {
         Binding(
@@ -35,17 +44,25 @@ struct RootView: View {
             SidebarView()
                 .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 270)
         } detail: {
-            if layoutMode == .expanded {
+            GeometryReader { geometry in
                 HSplitView {
-                    projectContent
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    VStack(spacing: 0) {
+                        projectContent
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-                    ActivityPanel()
-                        .frame(minWidth: 280, idealWidth: 320, maxWidth: 420, maxHeight: .infinity)
+                        if activityPresentation.showsCompactPanel {
+                            Divider()
+                            ActivityPanel(onClose: { activityPresentation.isVisible = false })
+                                .frame(height: min(300, geometry.size.height * 0.45))
+                        }
+                    }
+                    .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
+
+                    if activityPresentation.showsSidebar {
+                        ActivityPanel(onClose: { activityPresentation.isVisible = false })
+                            .frame(minWidth: 300, idealWidth: 340, maxWidth: 420, maxHeight: .infinity)
+                    }
                 }
-            } else {
-                projectContent
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         .background(WindowWidthReader(onChange: updateLayout))
@@ -73,19 +90,13 @@ struct RootView: View {
                 .disabled(!model.isConnected || model.isLoading)
                 .help("Reload managed projects, versions, signing readiness, credentials, and artifacts from the FRK CLI.")
 
-                if layoutMode != .expanded {
-                    Button {
-                        showCompactActivity.toggle()
-                    } label: {
-                        Label("Activity", systemImage: model.isRunning ? "waveform.circle.fill" : "terminal")
-                    }
-                    .help("Show live output for the current or most recent FRK command.")
-                    .popover(isPresented: $showCompactActivity, arrowEdge: .top) {
-                        ActivityPanel()
-                            .environmentObject(model)
-                            .frame(width: 460, height: 560)
-                    }
+                Button {
+                    activityPresentation.isVisible.toggle()
+                } label: {
+                    Label("Activity", systemImage: model.isRunning ? "waveform.circle.fill" : "terminal")
                 }
+                .keyboardShortcut("l", modifiers: [.command, .shift])
+                .help("Show or hide activity (⇧⌘L). Opens automatically when a job starts.")
 
                 Button {
                     model.showSettings = true
@@ -127,12 +138,18 @@ struct RootView: View {
         .task {
             await model.bootstrap()
         }
+        .onChange(of: model.activityRunID) {
+            // A launch failure can set isRunning to true and back to false within
+            // one UI update. The run ID remains observable even for that failure.
+            activityPresentation.isVisible = true
+        }
     }
 
     @ViewBuilder
     private var projectContent: some View {
-        if model.selectedProject != nil {
+        if let project = model.selectedProject {
             ProjectDetailView()
+                .id(project.id)
         } else {
             EmptySelectionView()
         }
@@ -140,15 +157,12 @@ struct RootView: View {
 
     private func updateLayout(for width: CGFloat) {
         let nextMode = WorkspaceLayoutMode(width: width)
-        guard nextMode != layoutMode else { return }
-        layoutMode = nextMode
+        guard nextMode != activityPresentation.layoutMode else { return }
+        activityPresentation.layoutMode = nextMode
         if nextMode == .focused {
             columnVisibility = .detailOnly
         } else {
             columnVisibility = .all
-        }
-        if nextMode == .expanded {
-            showCompactActivity = false
         }
     }
 }

@@ -38,6 +38,7 @@ These hold across every change. Breaking one is a defect, not a trade-off.
 | CLI command or flag | `bin/frk` |
 | Machine API field | `bin/frk` + `docs/MACHINE_API.md` + `desktop/ReleaseKitApp/Sources/Models.swift`, in one commit |
 | Desktop UI | `desktop/ReleaseKitApp/Sources/` |
+| Local AI/MCP tools | `integrations/mcp/` + `docs/MCP.md`; call the existing machine API |
 
 The machine API row is the one that bites. There is no schema and no codegen,
 but the **key names** are pinned across Python and Swift by a golden fixture,
@@ -68,11 +69,15 @@ make check     # both
 Use `make check` before handing work off. `make test` skips the Swift half and
 will pass while the desktop app is broken.
 
+For changes under `integrations/mcp/`, also run `make mcp` (requires `uv`). Its
+SDK dependencies are optional and isolated from the CLI, and its tests use a
+fake CLI or a synthetic temporary vault. Never exercise real uploads in MCP tests.
+
 `make check` covers the macOS half of CI. Two CI jobs need tools the `Makefile`
 does not assume, so reproduce them by hand when a change could affect them:
 
 ```bash
-pipx run ruff==0.16.2 check bin/frk tests/     # lint job; config in ruff.toml
+pipx run ruff==0.16.2 check bin/frk tests/ integrations/mcp/ # lint; config in ruff.toml
 /usr/bin/python3 -m unittest discover -s tests # the 3.9 floor CI also enforces
 ```
 

@@ -3,6 +3,9 @@ import SwiftUI
 
 struct ActivityPanel: View {
     @EnvironmentObject private var model: AppModel
+    var onClose: (() -> Void)? = nil
+    @State private var followsOutput = true
+    @State private var didCopy = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -19,9 +22,11 @@ struct ActivityPanel: View {
                 if !model.activity.isEmpty {
                     Button {
                         copyActivityToPasteboard()
+                        didCopy = true
                     } label: {
-                        Label("Copy", systemImage: "doc.on.doc")
+                        Label(didCopy ? "Copied" : "Copy", systemImage: didCopy ? "checkmark" : "doc.on.doc")
                     }
+                    .labelStyle(.iconOnly)
                     .controlSize(.small)
                     .help("Copy the full activity log to the clipboard, including any stack trace.")
                 }
@@ -41,8 +46,25 @@ struct ActivityPanel: View {
                     .controlSize(.small)
                     .help("Clear only the visible activity history. Project files, artifacts, and store releases are not changed.")
                 }
+                if let onClose {
+                    Button(action: onClose) {
+                        Image(systemName: "xmark")
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Hide activity")
+                    .help("Hide this panel. Running jobs continue.")
+                }
             }
             .padding(14)
+
+            if let context = model.activityContext, !context.isEmpty {
+                Text(context)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 10)
+            }
 
             Divider()
 
@@ -52,16 +74,40 @@ struct ActivityPanel: View {
             }
 
             if model.activity.isEmpty {
-                ContentUnavailableView {
-                    Label("Ready", systemImage: "terminal")
-                } description: {
+                VStack(spacing: 12) {
+                    Image(systemName: "terminal")
+                        .font(.largeTitle)
+                        .foregroundStyle(.tertiary)
+                    Text("Ready")
+                        .font(.headline)
                     Text("Build and release output appears here in real time.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
+                .padding(24)
+                .frame(maxWidth: .infinity)
             } else {
-                ActivityLog(lines: model.activity)
+                HStack {
+                    Text("\(model.activity.count) lines")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Toggle("Follow output", isOn: $followsOutput)
+                        .toggleStyle(.checkbox)
+                        .font(.caption)
+                        .help("Turn off to read earlier output without jumping to new lines.")
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+                ActivityLog(lines: model.activity, followsOutput: followsOutput)
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(Color(nsColor: .textBackgroundColor).opacity(0.45))
+        .onChange(of: model.activity.last?.id) { didCopy = false }
+        .onChange(of: model.activityRunID) { followsOutput = true }
     }
 
     /// fastlane's own message, pulled out of the scrolling log so the auto-scroll that
@@ -122,6 +168,7 @@ struct ActivityPanel: View {
 
 private struct ActivityLog: View {
     let lines: [ActivityLine]
+    let followsOutput: Bool
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -142,11 +189,13 @@ private struct ActivityLog: View {
                 }
                 .padding(14)
             }
-            .onChange(of: lines.count) {
-                guard let last = lines.last else { return }
-                withAnimation(.easeOut(duration: 0.15)) {
-                    proxy.scrollTo(last.id, anchor: .bottom)
-                }
+            .onChange(of: lines.last?.id, initial: true) {
+                guard followsOutput, let last = lines.last else { return }
+                proxy.scrollTo(last.id, anchor: .bottom)
+            }
+            .onChange(of: followsOutput) {
+                guard followsOutput, let last = lines.last else { return }
+                proxy.scrollTo(last.id, anchor: .bottom)
             }
         }
     }

@@ -19,6 +19,8 @@ Standard library only — no gems, no pip installs, no bundler.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
@@ -42,7 +44,7 @@ KIT_ROOT = Path(__file__).resolve().parent.parent
 # path, so re-executing the shipped script is the only sane reading anyway.
 CLI_ENTRYPOINT = KIT_ROOT / "bin" / "frk"
 TEMPLATES = KIT_ROOT / "templates"
-VERSION = "0.8.0"
+VERSION = "0.8.1"
 API_PROTOCOL_VERSION = 1
 # The one action list for `frk api run`. The `api run` argparse choices, the
 # `capabilities` document and the `api_action_command` dispatch all used to
@@ -105,6 +107,9 @@ KEYCHAIN_TIMEOUT_SECONDS = 20
 # which is the side that can attribute a timeout to one store and still report
 # the other.
 STORE_VERSIONS_TIMEOUT_SECONDS = 300
+# Cleanup is bounded separately from a build/query's own running time. A stuck
+# tool must not hold the desktop's Cancel button indefinitely.
+PROCESS_TERMINATION_GRACE_SECONDS = 5
 # The lane prints exactly one of these lines; everything else it writes is
 # fastlane chatter that must never reach the document. Kept in sync with
 # `fastlane/Fastfile`; the trailing `:1` is the report's own version.
@@ -259,6 +264,44 @@ def ensure_private_dir(path: Path) -> None:
     path.chmod(0o700)
 
 
+@contextmanager
+def file_update_lock(path: Path):
+    """Serialize FRK read/modify/write operations, including atomic replacements.
+
+    Lock a stable sidecar in the private vault, not the replaced file's inode.
+    Project directories remain free of lock files. The OS releases the lock if
+    a command crashes; the sidecar must not be unlinked while waiters exist.
+    """
+    ensure_private_dir(credentials_dir())
+    directory = credentials_dir() / ".locks"
+    ensure_private_dir(directory)
+    key = hashlib.sha256(os.fsencode(path.resolve())).hexdigest()
+    descriptor = os.open(directory / key, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def atomic_write_text(path: Path, content: str, *, mode: int | None = None) -> None:
+    """Replace complete UTF-8 content, preserving symlinks and cleaning failures."""
+    path = path.resolve()
+    if mode is None:
+        mode = path.stat().st_mode & 0o777
+    descriptor, filename = tempfile.mkstemp(prefix=f".{path.name}.tmp-", dir=path.parent)
+    temporary = Path(filename)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as output:
+            os.fchmod(output.fileno(), mode)
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 # One upgrade step per entry, keyed by the version it reads. Each value takes a
 # registry document at that version and returns it at version + 1, so a format
 # change is a new entry rather than another branch inside load_registry. Empty
@@ -311,10 +354,7 @@ def save_registry(data: dict) -> None:
     ensure_private_dir(credentials_dir())
     data["version"] = REGISTRY_VERSION
     registry = registry_path()
-    temp = registry.with_suffix(".tmp")
-    temp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    temp.chmod(0o600)
-    temp.replace(registry)
+    atomic_write_text(registry, json.dumps(data, indent=2, ensure_ascii=False) + "\n", mode=0o600)
 
 
 def _scan_single_quoted(raw: str):
@@ -387,17 +427,14 @@ def config_setting(app: Path, key: str) -> str:
 
 
 def find_top_level_yaml_block(lines: list[str], name: str) -> tuple[int, int] | None:
-    """Line range [start, end) of a top-level `{name}:` block: the line itself
-    through everything until the next top-level key or end of file. Blank
-    lines and comments inside the block do not end it, matching how YAML
-    itself scopes a mapping's nested content."""
-    start = None
-    for i, line in enumerate(lines):
-        if re.match(rf"^{re.escape(name)}:[ \t]*$", line):
-            start = i
-            break
-    if start is None:
+    """Find one block mapping; refuse ambiguous shapes before an edit."""
+    key = rf"(?:{re.escape(name)}|'{re.escape(name)}'|\"{re.escape(name)}\")"
+    matches = [i for i, line in enumerate(lines) if re.match(rf"^{key}[ \t]*:", line)]
+    if not matches:
         return None
+    if len(matches) != 1 or not re.fullmatch(rf"{key}[ \t]*:[ \t]*(?:#.*)?", lines[matches[0]]):
+        die(f"cannot safely edit `{name}`: use a single YAML block mapping")
+    start = matches[0]
     end = len(lines)
     for i in range(start + 1, len(lines)):
         if lines[i] and not lines[i][0].isspace() and not lines[i].startswith("#"):
@@ -406,43 +443,110 @@ def find_top_level_yaml_block(lines: list[str], name: str) -> tuple[int, int] | 
     return start, end
 
 
+def yaml_section_indent(lines: list[str], section: tuple[int, int]) -> int:
+    widths = [len(line) - len(line.lstrip(" ")) for line in lines[section[0] + 1:section[1]]
+              if line.strip() and not line.lstrip().startswith("#")]
+    return min(widths, default=2)
+
+
+def yaml_key_line(lines: list[str], within: tuple[int, int], key: str, indent: int) -> int | None:
+    key_pattern = rf"(?:{re.escape(key)}|'{re.escape(key)}'|\"{re.escape(key)}\")"
+    matches = [i for i in range(*within)
+               if re.match(rf"^{' ' * indent}{key_pattern}[ \t]*:", lines[i])]
+    if len(matches) > 1:
+        die(f"cannot safely edit duplicate `{key}` keys; keep one definition")
+    return matches[0] if matches else None
+
+
 def find_yaml_list_block(
     lines: list[str], within: tuple[int, int], key: str, indent: int
 ) -> tuple[int, int] | None:
-    """Line range [start, end) of an indented `{key}:` block and the `- "..."`
-    items one indent level deeper, searched only within `within`. Matches only
-    the exact shape this file writes; a list interleaved with blank lines or
-    comments between items is a hand-editing style this does not follow."""
-    key_prefix = " " * indent
-    item_prefix = " " * (indent + 2)
-    start_within, end_within = within
-    start = None
-    for i in range(start_within, end_within):
-        if re.match(rf"^{key_prefix}{re.escape(key)}:[ \t]*$", lines[i]):
-            start = i
-            break
+    start = yaml_key_line(lines, within, key, indent)
     if start is None:
         return None
     end = start + 1
-    while end < end_within and lines[end].startswith(item_prefix + "-"):
-        end += 1
+    item_indent = None
+    for i in range(start + 1, within[1]):
+        line = lines[i]
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        width = len(line) - len(line.lstrip(" "))
+        is_item = re.match(r"^-(?:[ \t]|$)", line.lstrip()) is not None
+        if width < indent or (width == indent and not is_item):
+            break
+        if not is_item:
+            die(f"cannot safely edit `{key}`: use a list of single-line strings")
+        if item_indent is not None and width != item_indent:
+            die(f"cannot safely edit `{key}`: nested lists are not supported")
+        item_indent = width
+        end = i + 1
     return start, end
 
 
-def read_yaml_string_list(lines: list[str], span: tuple[int, int] | None) -> list[str]:
+def yaml_inline_comment(raw: str) -> str:
+    """Find a YAML comment outside quoted values, retaining its leading space."""
+    quote = None
+    index = 0
+    while index < len(raw):
+        character = raw[index]
+        if quote == '"' and character == "\\":
+            index += 2
+            continue
+        if character == quote:
+            if quote == "'" and raw[index + 1:index + 2] == "'":
+                index += 2
+                continue
+            quote = None
+        elif quote is None:
+            if character in "\"'" and (index == 0 or raw[index - 1] in " \t[,:"):
+                quote = character
+            elif character == "#" and (index == 0 or raw[index - 1].isspace()):
+                start = index
+                while start > 0 and raw[start - 1] in " \t":
+                    start -= 1
+                return raw[start:]
+        index += 1
+    return ""
+
+
+def yaml_list_values(lines: list[str], span: tuple[int, int] | None) -> list[str]:
     if span is None:
         return []
     start, end = span
-    values = []
-    for line in lines[start + 1 : end]:
-        item = line.strip()
-        if not item.startswith("- "):
-            continue
-        raw = item[2:].strip()
+    tail = lines[start].split(":", 1)[1].strip()
+    if tail and not tail.startswith("#"):
+        # JSON-style flow lists are unambiguous. Other YAML flow/anchor/block
+        # forms stay untouched and get an actionable error instead of a second key.
         try:
-            values.append(json.loads(raw))
-        except (json.JSONDecodeError, ValueError):
-            values.append(raw.strip("\"'"))
+            values, offset = json.JSONDecoder().raw_decode(tail)
+            rest = tail[offset:].strip()
+            if (not isinstance(values, list) or any(not isinstance(v, str) for v in values)
+                    or (rest and not rest.startswith("#")) or end != start + 1):
+                raise ValueError
+            return values
+        except ValueError:
+            die("cannot safely edit `extra_build_args`: use a block list of quoted strings")
+    values = []
+    for line in lines[start + 1:end]:
+        if not re.match(r"^-(?:[ \t]|$)", line.lstrip()):
+            continue
+        raw = line.lstrip()[1:].strip()
+        if (not raw or raw[0] in "|>&*!{[#" or raw.startswith("- ")
+                or ": " in raw and raw[0] not in "\"'"):
+            die("cannot safely edit `extra_build_args`: use single-line string items")
+        if raw.startswith('"'):
+            try:
+                value, offset = json.JSONDecoder().raw_decode(raw)
+                rest = raw[offset:].strip()
+                if not isinstance(value, str) or rest and not rest.startswith("#"):
+                    raise ValueError
+            except ValueError:
+                die("cannot safely edit `extra_build_args`: invalid quoted string")
+        elif raw.startswith("'"):
+            scanned = _scan_single_quoted(raw)
+            if scanned is None or (raw[scanned[1]:].strip() and not raw[scanned[1]:].strip().startswith("#")):
+                die("cannot safely edit `extra_build_args`: invalid quoted string")
+        values.append(parse_config_name(raw, ""))
     return values
 
 
@@ -451,116 +555,102 @@ def platform_extra_build_args(app: Path, platform: str) -> list[str]:
     section = find_top_level_yaml_block(lines, platform)
     if section is None:
         return []
-    return read_yaml_string_list(lines, find_yaml_list_block(lines, section, "extra_build_args", 2))
+    return yaml_list_values(lines, find_yaml_list_block(
+        lines, section, "extra_build_args", yaml_section_indent(lines, section)))
 
 
 def shared_extra_build_args(app: Path) -> list[str]:
     lines = read(app / CONFIG_NAME).splitlines()
-    end = len(lines)
-    for i, line in enumerate(lines):
-        if re.match(r"^(android|ios):[ \t]*$", line):
-            end = i
-            break
-    return read_yaml_string_list(lines, find_yaml_list_block(lines, (0, end), "extra_build_args", 0))
+    return yaml_list_values(lines, find_yaml_list_block(lines, (0, len(lines)), "extra_build_args", 0))
+
+
+def read_editable_config(path: Path) -> tuple[str, list[str], str]:
+    # Strict decoding and newline preservation: a write must never silently
+    # replace undecodable bytes or normalize the rest of a project's file.
+    with path.open(encoding="utf-8", newline="") as source:
+        text = source.read()
+    newline = "\r\n" if "\r\n" in text else "\n"
+    if newline == "\r\n" and "\n" in text.replace("\r\n", ""):
+        die(f"cannot safely edit {path}: mixed line endings")
+    if re.search(r"^[ \t]*\t", text, re.M):
+        die(f"cannot safely edit {path}: use spaces for YAML indentation")
+    return text, text.removesuffix(newline).split(newline), newline
+
+
+def write_config_lines(path: Path, original: str, lines: list[str], newline: str) -> None:
+    updated = newline.join(lines) + (newline if original.endswith(newline) else "")
+    if updated != original:
+        atomic_write_text(path, updated)
 
 
 def set_platform_extra_build_args(app: Path, platform: str, args: list[str]) -> None:
-    """Rewrites only `{platform}:`'s `extra_build_args:` list, preserving every
-    other line — comments, spacing, and the other platform's section — byte
-    for byte. An empty `args` with nothing currently set is a true no-op: the
-    file is not touched, and its mtime does not change."""
+    """Patch one list, preserving unrelated settings and rejecting ambiguous YAML."""
     path = app / CONFIG_NAME
-    text = read(path)
-    lines = text.splitlines()
-    trailing_newline = text.endswith("\n")
-
-    section = find_top_level_yaml_block(lines, platform)
-    if section is None:
-        die(f"{path}: no `{platform}:` section — is this project onboarded for {platform}?")
-
-    existing = find_yaml_list_block(lines, section, "extra_build_args", 2)
-    if existing is None and not args:
-        return
-
-    new_block = []
-    if args:
-        new_block = ["  extra_build_args:"] + [f"    - {json.dumps(a, ensure_ascii=False)}" for a in args]
-
-    if existing is not None:
-        start, end = existing
-        lines[start:end] = new_block
-        if not args and 0 < start < len(lines) and lines[start - 1].strip() == "" and lines[start].strip() == "":
-            del lines[start]
-    else:
-        section_start, section_end = section
-        insert_at = section_end
-        while insert_at > section_start + 1 and lines[insert_at - 1].strip() == "":
-            insert_at -= 1
-        prefix = [""] if insert_at > section_start + 1 and lines[insert_at - 1].strip() != "" else []
-        lines[insert_at:insert_at] = prefix + new_block
-
-    new_text = "\n".join(lines)
-    if trailing_newline or new_text:
-        new_text += "\n"
-    if new_text == text:
-        return
-
-    temp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    temp.write_text(new_text, encoding="utf-8")
-    try:
-        temp.chmod(path.stat().st_mode & 0o777)
-    except OSError:
-        pass
-    os.replace(temp, path)
+    with file_update_lock(path):
+        text, lines, newline = read_editable_config(path)
+        section = find_top_level_yaml_block(lines, platform)
+        if section is None:
+            die(f"{path}: no `{platform}:` section — is this project onboarded for {platform}?")
+        indent = yaml_section_indent(lines, section)
+        existing = find_yaml_list_block(lines, section, "extra_build_args", indent)
+        if yaml_list_values(lines, existing) == args:
+            return
+        prefix = " " * indent
+        new_block = ([prefix + "extra_build_args:"] +
+                     [prefix + f"  - {json.dumps(a, ensure_ascii=False)}" for a in args]) if args else []
+        if existing is not None:
+            start, end = existing
+            # Keep comments/blank lines between items, including the header note.
+            header_note = yaml_inline_comment(lines[start].split(":", 1)[1])
+            comments = []
+            for line in lines[start + 1:end]:
+                if not line.strip() or line.lstrip().startswith("#"):
+                    comments.append(line)
+                elif yaml_inline_comment(line):
+                    comments.append(prefix + yaml_inline_comment(line).lstrip())
+            if header_note:
+                if new_block:
+                    new_block[0] += header_note
+                else:
+                    comments.insert(0, prefix + header_note.lstrip())
+            lines[start:end] = comments + new_block
+            if not args and 0 < start < len(lines) and not lines[start - 1].strip() and not lines[start].strip():
+                del lines[start]
+        else:
+            insert_at = section[1]
+            while insert_at > section[0] + 1 and not lines[insert_at - 1].strip():
+                insert_at -= 1
+            spacer = [""] if insert_at > section[0] + 1 and lines[insert_at - 1].strip() else []
+            lines[insert_at:insert_at] = spacer + new_block
+        write_config_lines(path, text, lines, newline)
 
 
 def set_android_track(app: Path, track: str) -> None:
-    """Rewrites only android's `track:` scalar, preserving every other line —
-    comments, spacing, extra_build_args, and the ios section — byte for byte.
-    Setting the value already in place is a true no-op: the file is not
-    touched, and its mtime does not change. Callers are expected to have
-    validated `track` against ANDROID_TRACKS already; this only knows how to
-    write whatever string it is given.
-    """
+    """Patch Android's direct track scalar, preserving comments and formatting."""
     path = app / CONFIG_NAME
-    text = read(path)
-    lines = text.splitlines()
-    trailing_newline = text.endswith("\n")
-
-    section = find_top_level_yaml_block(lines, "android")
-    if section is None:
-        die(f"{path}: no `android:` section — is this project onboarded for android?")
-    start, end = section
-
-    line_index = None
-    for i in range(start + 1, end):
-        if re.match(r"^[ \t]+track:[ \t]*", lines[i]):
-            line_index = i
-            break
-
-    new_line = f"  track: {track}"
-    if line_index is not None:
-        if lines[line_index] == new_line:
-            return
-        lines[line_index] = new_line
-    else:
-        # Every onboarded android section carries a track line; this only
-        # covers a config edited by hand after the fact to drop it.
-        lines[start + 1 : start + 1] = [new_line]
-
-    new_text = "\n".join(lines)
-    if trailing_newline or new_text:
-        new_text += "\n"
-    if new_text == text:
-        return
-
-    temp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    temp.write_text(new_text, encoding="utf-8")
-    try:
-        temp.chmod(path.stat().st_mode & 0o777)
-    except OSError:
-        pass
-    os.replace(temp, path)
+    with file_update_lock(path):
+        text, lines, newline = read_editable_config(path)
+        section = find_top_level_yaml_block(lines, "android")
+        if section is None:
+            die(f"{path}: no `android:` section — is this project onboarded for android?")
+        indent = yaml_section_indent(lines, section)
+        index = yaml_key_line(lines, section, "track", indent)
+        if index is not None:
+            raw = lines[index].split(":", 1)[1]
+            if parse_config_name(raw, "") == track:
+                return
+            # A track is a single scalar; do not replace a nested mapping/list.
+            for line in lines[index + 1:section[1]]:
+                if not line.strip() or line.lstrip().startswith("#"):
+                    continue
+                width = len(line) - len(line.lstrip(" "))
+                if width > indent or width == indent and re.match(r"^-(?:[ \t]|$)", line.lstrip()):
+                    die("cannot safely edit `track`: use a single string value")
+                break
+            lines[index] = " " * indent + f"track: {track}" + yaml_inline_comment(raw)
+        else:
+            lines[section[0] + 1:section[0] + 1] = [" " * indent + f"track: {track}"]
+        write_config_lines(path, text, lines, newline)
 
 
 def validate_project_identity(app: Path) -> None:
@@ -616,25 +706,30 @@ def ensure_registry_name_available(app: Path, name: str) -> None:
 def register_project(app: Path) -> None:
     app = app.resolve()
     name, platforms = config_summary(app)
-    ensure_registry_name_available(app, name)
-    data = load_registry()
-    projects = []
-    for project in data["projects"]:
-        old_path = Path(project.get("path", "")).expanduser()
-        same_path = old_path.resolve() == app
-        # Re-onboarding a moved project should heal the registry instead of
-        # leaving an unreachable duplicate with the same name.
-        moved_same_app = project.get("name") == name and not old_path.exists()
-        if not same_path and not moved_same_app:
-            projects.append(project)
-    projects.append({
-        "name": name,
-        "path": str(app),
-        "platforms": platforms,
-        "added_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    })
-    data["projects"] = sorted(projects, key=lambda p: (p.get("name", "").lower(), p.get("path", "")))
-    save_registry(data)
+    with file_update_lock(registry_path()):
+        ensure_registry_name_available(app, name)
+        data = load_registry()
+        projects = []
+        previous = {}
+        for project in data["projects"]:
+            old_path = Path(project.get("path", "")).expanduser()
+            same_path = old_path.resolve() == app
+            moved_same_app = project.get("name") == name and not old_path.exists()
+            if same_path or moved_same_app:
+                previous = project
+            else:
+                projects.append(project)
+        projects.append({
+            **previous,
+            "name": name,
+            "path": str(app),
+            "platforms": platforms,
+            "added_at": previous.get("added_at") or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        })
+        projects.sort(key=lambda p: (p.get("name", "").lower(), p.get("path", "")))
+        if projects != data["projects"]:
+            data["projects"] = projects
+            save_registry(data)
 
 
 def managed_projects() -> list[dict]:
@@ -1174,22 +1269,93 @@ def run_fastlane(
     return subprocess.call(command, cwd=app, env=fastlane_env())
 
 
+def signal_process_group(process, number: int) -> None:
+    # The group may outlive its leader. Checking poll() first leaves helpers
+    # alive (and inherited stdout open) after a wrapper has already exited.
+    try:
+        os.killpg(process.pid, number)
+    except ProcessLookupError:
+        pass
+
+
+class ProcessCancelled(BaseException):
+    """A caller requested cancellation, distinct from a failed child command."""
+
+    def __init__(self, signum: int):
+        self.exit_code = 128 + signum
+        super().__init__(f"Command cancelled by signal {signum}")
+
+
+def stop_process_group(process) -> None:
+    """Stop this command's group and reap its leader without an unbounded wait."""
+    signal_process_group(process, signal.SIGTERM)
+    try:
+        process.communicate(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        # A broken output pipe must not prevent cleanup either.
+        pass
+    finally:
+        # Also stop helpers that survived their leader but closed their pipes;
+        # communicate() completing alone does not prove the group is empty.
+        signal_process_group(process, signal.SIGKILL)
+        process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+
+
+@contextmanager
+def managed_child(command: list[str], **kwargs):
+    """Own one process group through cancellation, timeout, or consumer failure.
+
+    Install handlers before spawning. A signal received during Popen is recorded
+    until we have the child handle, closing the spawn/adoption orphan window.
+    Repeated cancellation while cleaning up does not interrupt the cleanup.
+    """
+    process = None
+    cancelled_signal = None
+    cleaning_up = False
+
+    def cancel(signum, frame):
+        nonlocal cancelled_signal
+        if cancelled_signal is None:
+            cancelled_signal = signum
+        if process is not None and not cleaning_up:
+            raise ProcessCancelled(cancelled_signal)
+
+    previous = {}
+    try:
+        for number in (signal.SIGTERM, signal.SIGINT):
+            previous[number] = signal.signal(number, cancel)
+        if cancelled_signal is not None:
+            raise ProcessCancelled(cancelled_signal)
+        process = subprocess.Popen(command, start_new_session=True, **kwargs)
+        if cancelled_signal is not None:
+            raise ProcessCancelled(cancelled_signal)
+        yield process
+    except BaseException:
+        cleaning_up = True
+        if process is not None:
+            stop_process_group(process)
+        raise
+    finally:
+        cleaning_up = True
+        try:
+            if process is not None:
+                for name in ("stdout", "stderr", "stdin"):
+                    pipe = getattr(process, name, None)
+                    if pipe is not None:
+                        pipe.close()
+        finally:
+            for number, handler in previous.items():
+                signal.signal(number, handler)
+
+
 def capture_fastlane(app: Path, lane: list[str], *, timeout: int) -> tuple[int, str]:
-    """Run one lane to completion and hand back its output instead of printing it.
+    """Capture a lane under a total deadline, keeping chatter off API stdout.
 
-    The streaming sibling above is wrong for a document command twice over: it
-    lets the child write straight onto this process's stdout, which would
-    interleave fastlane chatter with the single JSON document a client is
-    parsing, and it waits forever. Nothing here reaches stdout — the caller
-    decides which of these bytes are an answer.
-
-    Raises subprocess.TimeoutExpired once the child stops making progress, after
-    killing it. `start_new_session` puts fastlane in its own process group so the
-    kill reaches ruby and whatever it spawned; signalling the pid alone would
-    leave the store connection open behind an already-answered command.
+    Cancellation and timeouts stop the lane's process group before returning.
+    The timeout measures elapsed time, even when the lane is printing output.
     """
     environment = {**fastlane_env(), "FASTLANE_DISABLE_COLORS": "1", "TERM": "dumb"}
-    process = subprocess.Popen(
+    with managed_child(
         fastlane_command(lane),
         cwd=app,
         env=environment,
@@ -1198,28 +1364,9 @@ def capture_fastlane(app: Path, lane: list[str], *, timeout: int) -> tuple[int, 
         text=True,
         encoding="utf-8",
         errors="replace",
-        start_new_session=True,
-    )
-    try:
+    ) as process:
         output, _ = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        signal_process_group(process, signal.SIGTERM)
-        try:
-            process.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            signal_process_group(process, signal.SIGKILL)
-            process.communicate()
-        raise
-    return process.returncode, output
-
-
-def signal_process_group(process, number: int) -> None:
-    if process.poll() is not None:
-        return
-    try:
-        os.killpg(process.pid, number)
-    except OSError:
-        pass
+        return process.returncode, output
 
 
 def lane_options(args, *, release: bool) -> list[str]:
@@ -1318,16 +1465,17 @@ def cmd_list(args) -> int:
 
 
 def cmd_forget(args) -> int:
-    app = resolve_app(args.app_dir)
-    data = load_registry()
-    before = len(data["projects"])
-    data["projects"] = [
-        p for p in data["projects"]
-        if Path(p.get("path", "")).expanduser().resolve() != app
-    ]
-    if len(data["projects"]) == before:
-        die(f"{app} is not in the managed-project registry")
-    save_registry(data)
+    with file_update_lock(registry_path()):
+        app = resolve_app(args.app_dir)
+        data = load_registry()
+        before = len(data["projects"])
+        data["projects"] = [
+            p for p in data["projects"]
+            if Path(p.get("path", "")).expanduser().resolve() != app
+        ]
+        if len(data["projects"]) == before:
+            die(f"{app} is not in the managed-project registry")
+        save_registry(data)
     ok(f"forgot {app}; no project files were changed")
     return 0
 
@@ -2411,6 +2559,12 @@ def cmd_api_store_versions(args) -> int:
         code, output = capture_fastlane(
             app, ["store_versions"], timeout=STORE_VERSIONS_TIMEOUT_SECONDS
         )
+    except ProcessCancelled as exc:
+        return api_error_exit(
+            "store_query_cancelled",
+            "Store check cancelled; the local store query was stopped",
+            exc.exit_code,
+        )
     except subprocess.TimeoutExpired:
         # "did not finish within", not "made no progress for": the budget is a
         # total wall-clock deadline (see STORE_VERSIONS_TIMEOUT_SECONDS), and a
@@ -2647,48 +2801,34 @@ def cmd_api_run(args) -> int:
     # `frk doctor .`, so the child inherits the caller's. Nothing in it needs
     # the kit checkout — KIT_ROOT and CLI_ENTRYPOINT are absolute, and
     # run_fastlane passes cwd=app itself.
-    process = subprocess.Popen(
-        command,
-        env=environment,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        bufsize=1,
-        start_new_session=True,
-    )
-
-    def terminate_group(signum, frame):
-        if process.poll() is None:
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-
-    previous_term = signal.signal(signal.SIGTERM, terminate_group)
-    previous_int = signal.signal(signal.SIGINT, terminate_group)
+    process = None
     sequence = 0
     try:
-        assert process.stdout is not None
-        for raw in process.stdout:
-            message = ANSI_ESCAPE.sub("", raw.rstrip("\r\n"))
-            if not message:
-                continue
-            sequence += 1
-            api_emit("log", action=args.action, sequence=sequence, stream="combined", message=message)
-        code = process.wait()
+        with managed_child(
+            command,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        ) as process:
+            assert process.stdout is not None
+            for raw in process.stdout:
+                message = ANSI_ESCAPE.sub("", raw.rstrip("\r\n"))
+                if not message:
+                    continue
+                sequence += 1
+                api_emit("log", action=args.action, sequence=sequence, stream="combined", message=message)
+            code = process.wait()
+    except ProcessCancelled as exc:
+        code = exc.exit_code
     except BaseException as exc:
-        # The child is detached with start_new_session, so nothing else will
-        # ever stop it, and the client blocks until it sees a terminal event.
-        # Reap the group and report, rather than leaving an orphan behind an
-        # unanswered `started`. `code` is unbound here: do not reference it.
-        if process.poll() is None:
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except OSError:
-                pass
-        process.wait()
+        if process is None:
+            # Keep launch failures on main()'s existing API error channel.
+            raise
+        # managed_child has already stopped and reaped this command's group.
         api_emit(
             "error",
             action=args.action,
@@ -2703,9 +2843,6 @@ def cmd_api_run(args) -> int:
             durationSeconds=round(time.monotonic() - started, 3),
         )
         return API_INTERNAL_EXIT
-    finally:
-        signal.signal(signal.SIGTERM, previous_term)
-        signal.signal(signal.SIGINT, previous_int)
 
     if code < 0:
         code = 128 + abs(code)
@@ -3519,13 +3656,14 @@ def cmd_setup(args) -> int:
     ok(f"credentials template: {env_file}{' (kept existing file)' if kept else ''}")
 
     registry = registry_path()
-    if registry.exists():
-        load_registry()
-        registry.chmod(0o600)
-        ok(f"project registry: {registry} (kept existing entries)")
-    else:
-        save_registry({"version": REGISTRY_VERSION, "projects": []})
-        ok(f"project registry: {registry}")
+    with file_update_lock(registry):
+        if registry.exists():
+            load_registry()
+            registry.chmod(0o600)
+            ok(f"project registry: {registry} (kept existing entries)")
+        else:
+            save_registry({"version": REGISTRY_VERSION, "projects": []})
+            ok(f"project registry: {registry}")
 
     bin_dir = (
         Path(args.bin_dir).expanduser().resolve()
@@ -3798,7 +3936,7 @@ def main() -> int:
     api_set_build_args.add_argument("--platform", required=True, choices=["android", "ios"])
     api_set_build_args.add_argument(
         "--arg", action="append", default=[],
-        help="one flag, e.g. --dart-define=KEY=value; repeat for more; omit entirely to clear",
+        help="use --arg=--dart-define=KEY=value; repeat for more; omit entirely to clear",
     )
     api_set_build_args.set_defaults(func=cmd_api_set_build_args, api_document_command=True)
 
@@ -3867,7 +4005,7 @@ def main() -> int:
     bg_set.add_argument("--platform", required=True, choices=["android", "ios"])
     bg_set.add_argument(
         "--arg", action="append", default=[],
-        help="one flag, e.g. --dart-define=KEY=value; repeat for more; omit entirely to clear",
+        help="use --arg=--dart-define=KEY=value; repeat for more; omit entirely to clear",
     )
     bg_set.set_defaults(func=cmd_build_args_set)
 

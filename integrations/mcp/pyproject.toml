@@ -1,0 +1,9 @@
+[project]
+name = "flutter-release-kit-mcp"
+version = "0.1.0"
+description = "Local MCP tools for the Flutter Release Kit machine API"
+requires-python = ">=3.10"
+dependencies = ["mcp==2.2.0"]
+
+[tool.uv]
+package = false

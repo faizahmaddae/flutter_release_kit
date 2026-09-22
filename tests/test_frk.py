@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -51,6 +52,12 @@ class FakeChild:
 
     def poll(self):
         return self.returncode if self.finished else None
+
+    def wait(self, timeout=None):
+        if self.hangs:
+            raise subprocess.TimeoutExpired("fastlane", timeout)
+        self.finished = True
+        return self.returncode
 
 # bin/frk derives every vault path from FLUTTER_RELEASE_HOME on each call, so
 # pointing the variable at a throwaway directory for the whole test process puts
@@ -531,6 +538,193 @@ class FrkTestCase(unittest.TestCase):
         after = (app / frk.CONFIG_NAME).read_text()
         self.assertEqual(before[before.index("ios:") :], after[after.index("ios:") :])
         self.assertIn('firebase_app_id: "1:000000000000:android:0000000000000000000000"', after)
+
+    def test_commented_lists_replace_all_items_and_preserve_other_settings(self):
+        app = self.write_extra_args_sample(text=self.EXTRA_ARGS_SAMPLE.replace(
+            "android:\n", "android: # Android options\n"
+        ).replace("  track: internal", '  extra_build_args: # flags\n'
+                  '    - "--old-a"\n\n    # keep this explanation\n'
+                  '    - "--old-b" # second flag\n  track: internal'))
+        self.assertEqual(["--old-a", "--old-b"], frk.platform_extra_build_args(app, "android"))
+        frk.set_platform_extra_build_args(app, "android", ["--new"])
+        self.assertEqual(["--new"], frk.platform_extra_build_args(app, "android"))
+        text = (app / frk.CONFIG_NAME).read_text()
+        self.assertNotIn("--old", text)
+        self.assertIn("# keep this explanation", text)
+        self.assertIn("# second flag", text)
+        self.assertIn("extra_build_args: # flags", text)
+        self.assertIn("  track: internal", text)
+        self.assertEqual(self.EXTRA_ARGS_SAMPLE.split("ios:")[1], text.split("ios:")[1])
+
+    def test_inline_lists_are_replaced_without_duplicate_keys(self):
+        app = self.write_extra_args_sample(text=self.EXTRA_ARGS_SAMPLE.replace(
+            "  track: internal", '  extra_build_args: ["--value=a # b"] # keep\n  track: internal'))
+        self.assertEqual(["--value=a # b"], frk.platform_extra_build_args(app, "android"))
+        frk.set_platform_extra_build_args(app, "android", ["--next"])
+        self.assertEqual(["--next"], frk.platform_extra_build_args(app, "android"))
+        self.assertEqual(1, (app / frk.CONFIG_NAME).read_text().count("  extra_build_args:"))
+        self.assertIn("extra_build_args: # keep", (app / frk.CONFIG_NAME).read_text())
+
+    def test_unsupported_and_duplicate_yaml_is_never_rewritten(self):
+        shapes = [
+            "  extra_build_args: [--flavor, demo]",
+            "  extra_build_args: *shared",
+            '  extra_build_args:\n    - "--a"\n  extra_build_args:\n    - "--b"',
+            '  extra_build_args:\n    - |\n      --multiline',
+            '  extra_build_args:\n    - "--a"\n      - "--nested"',
+            '  extra_build_args:\n  -',
+            '  extra_build_args:\n    - - "--nested"',
+        ]
+        for index, shape in enumerate(shapes):
+            with self.subTest(shape=shape):
+                app = self.write_extra_args_sample(name=f"unsafe{index}", text=self.EXTRA_ARGS_SAMPLE.replace(
+                    "  track: internal", shape + "\n  track: internal"))
+                path = app / frk.CONFIG_NAME
+                original = path.read_bytes()
+                with self.assertRaises(SystemExit):
+                    frk.set_platform_extra_build_args(app, "android", ["--new"])
+                self.assertEqual(original, path.read_bytes())
+
+    def test_config_edits_preserve_crlf_no_final_newline_permissions_and_symlink(self):
+        app = self.write_extra_args_sample()
+        path = app / frk.CONFIG_NAME
+        target = self.root / "linked-config.yml"
+        text = self.EXTRA_ARGS_SAMPLE.rstrip("\n").replace("\n", "\r\n")
+        target.write_bytes(text.encode())
+        target.chmod(0o640)
+        path.unlink()
+        path.symlink_to(target)
+        frk.set_android_track(app, "beta")
+        self.assertTrue(path.is_symlink())
+        self.assertEqual(text.replace("track: internal", "track: beta").encode(), target.read_bytes())
+        frk.set_platform_extra_build_args(app, "ios", ["--x"])
+        updated = target.read_bytes()
+        self.assertNotIn(b"\n", updated.replace(b"\r\n", b""))
+        self.assertFalse(updated.endswith(b"\n"))
+        self.assertEqual(0o640, stat.S_IMODE(target.stat().st_mode))
+
+    def test_track_edit_preserves_comment_and_ignores_nested_track(self):
+        app = self.write_extra_args_sample(text=self.EXTRA_ARGS_SAMPLE.replace(
+            "  track: internal", '  custom:\n    track: nested\n  track: "internal" # testing only'))
+        path = app / frk.CONFIG_NAME
+        before = path.read_bytes()
+        stamp = path.stat().st_mtime_ns
+        frk.set_android_track(app, "internal")
+        self.assertEqual(before, path.read_bytes())
+        self.assertEqual(stamp, path.stat().st_mtime_ns)
+        frk.set_android_track(app, "beta")
+        self.assertEqual(before.replace(b'"internal"', b'beta'), path.read_bytes())
+
+    def test_shared_flags_can_follow_platform_sections(self):
+        app = self.write_extra_args_sample(text=self.EXTRA_ARGS_SAMPLE + 'extra_build_args:\n  - "--shared"\n')
+        self.assertEqual(["--shared"], frk.shared_extra_build_args(app))
+        self.assertEqual([], frk.platform_extra_build_args(app, "ios"))
+
+    def test_quoted_keys_and_nonstandard_indentation_do_not_create_duplicate_settings(self):
+        app = self.write_extra_args_sample(text=(
+            'android: # platform\n'
+            '    "track" : internal # keep\n'
+            '    "extra_build_args" :\n'
+            '    - "--old"\n'
+            'ios:\n    bundle_id: org.example.app\n'
+        ))
+        frk.set_android_track(app, "alpha")
+        frk.set_platform_extra_build_args(app, "android", ["--new"])
+        text = (app / frk.CONFIG_NAME).read_text()
+        self.assertEqual(1, text.count("track"))
+        self.assertEqual(1, text.count("extra_build_args"))
+        self.assertIn("    track: alpha # keep", text)
+        self.assertEqual(["--new"], frk.platform_extra_build_args(app, "android"))
+
+    def test_concurrent_config_edits_keep_both_platforms_and_track(self):
+        app = self.write_extra_args_sample()
+        script = """
+import importlib.util, sys, time
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+spec = importlib.util.spec_from_loader('frk', SourceFileLoader('frk', sys.argv[1]))
+frk = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(frk)
+original = frk.read_editable_config
+def slow_read(path):
+    result = original(path)
+    time.sleep(0.1)
+    return result
+frk.read_editable_config = slow_read
+app = Path(sys.argv[2])
+if sys.argv[3] == 'track':
+    frk.set_android_track(app, 'beta')
+else:
+    frk.set_platform_extra_build_args(app, sys.argv[3], ['--' + sys.argv[3]])
+"""
+        children = [subprocess.Popen([sys.executable, "-c", script, str(FRK_PATH), str(app), field],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    for field in ("track", "android", "ios")]
+        try:
+            for child in children:
+                _, error = child.communicate(timeout=15)
+                self.assertEqual(0, child.returncode, error.decode())
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                child.wait()
+        self.assertEqual("beta", frk.config_setting(app, "track"))
+        self.assertEqual(["--android"], frk.platform_extra_build_args(app, "android"))
+        self.assertEqual(["--ios"], frk.platform_extra_build_args(app, "ios"))
+
+    def test_failed_atomic_edit_keeps_original_and_removes_temporary_file(self):
+        app = self.write_extra_args_sample()
+        path = app / frk.CONFIG_NAME
+        before = path.read_bytes()
+        with patch.object(frk.os, "replace", side_effect=OSError("simulated failure")):
+            with self.assertRaises(OSError):
+                frk.set_android_track(app, "beta")
+        self.assertEqual(before, path.read_bytes())
+        self.assertEqual([], list(path.parent.glob(".*.tmp-*")))
+
+    def test_registering_again_preserves_metadata_and_is_a_noop(self):
+        app = self.make_android_app()
+        frk.register_project(app)
+        data = frk.load_registry()
+        data["projects"][0].update(added_at="2020-01-01T00:00:00Z", custom="preserved")
+        frk.save_registry(data)
+        before = frk.registry_path().read_bytes()
+        stamp = frk.registry_path().stat().st_mtime_ns
+        frk.register_project(app)
+        self.assertEqual(before, frk.registry_path().read_bytes())
+        self.assertEqual(stamp, frk.registry_path().stat().st_mtime_ns)
+
+    def test_concurrent_registration_keeps_every_project(self):
+        apps = [self.make_android_app(name=f"concurrent{i}") for i in range(4)]
+        script = """
+import importlib.util, sys, time
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+spec = importlib.util.spec_from_loader('frk', SourceFileLoader('frk', sys.argv[1]))
+frk = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(frk)
+original = frk.load_registry
+def slow_read():
+    data = original()
+    time.sleep(0.1)
+    return data
+frk.load_registry = slow_read
+frk.register_project(Path(sys.argv[2]))
+"""
+        children = [subprocess.Popen([sys.executable, "-c", script, str(FRK_PATH), str(app)],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE) for app in apps]
+        try:
+            for child in children:
+                _, error = child.communicate(timeout=15)
+                self.assertEqual(0, child.returncode, error.decode())
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                child.wait()
+        self.assertEqual({str(app.resolve()) for app in apps}, {p["path"] for p in frk.managed_projects()})
+        self.assertEqual(0o600, stat.S_IMODE(frk.registry_path().stat().st_mode))
 
     # ----------------------------------------------------------------- #
     # extra_build_args — human CLI
@@ -3178,7 +3372,7 @@ class FrkTestCase(unittest.TestCase):
 
         # SIGTERM to the group, not the pid: fastlane's ruby child would
         # otherwise keep the store connection open behind an answered command.
-        self.assertEqual([(child.pid, frk.signal.SIGTERM)], killed)
+        self.assertEqual([(child.pid, frk.signal.SIGTERM), (child.pid, frk.signal.SIGKILL)], killed)
 
     def test_capture_fastlane_escalates_to_sigkill_when_sigterm_is_ignored(self):
         child = FakeChild(hangs=True)
@@ -3199,6 +3393,192 @@ class FrkTestCase(unittest.TestCase):
         self.assertEqual(
             [(child.pid, frk.signal.SIGTERM), (child.pid, frk.signal.SIGKILL)], killed
         )
+
+    def test_cancellation_during_spawn_is_remembered_and_handlers_are_restored(self):
+        child = FakeChild()
+        previous = {number: frk.signal.getsignal(number) for number in (frk.signal.SIGTERM, frk.signal.SIGINT)}
+
+        def spawn(*args, **kwargs):
+            frk.signal.getsignal(frk.signal.SIGTERM)(frk.signal.SIGTERM, None)
+            return child
+
+        with patch.object(frk.subprocess, "Popen", side_effect=spawn), patch.object(frk.os, "killpg") as killpg:
+            with self.assertRaises(frk.ProcessCancelled) as cancelled:
+                frk.capture_fastlane(self.root, ["store_versions"], timeout=300)
+        self.assertEqual(143, cancelled.exception.exit_code)
+        self.assertTrue(child.finished)
+        self.assertEqual([frk.signal.SIGTERM, frk.signal.SIGKILL], [call.args[1] for call in killpg.call_args_list])
+        for number, handler in previous.items():
+            self.assertEqual(handler, frk.signal.getsignal(number))
+
+    def test_repeated_cancellation_cannot_interrupt_cleanup(self):
+        child = FakeChild()
+        original = child.communicate
+
+        def communicate(timeout=None):
+            handler = frk.signal.getsignal(frk.signal.SIGTERM)
+            handler(frk.signal.SIGTERM, None)
+            handler(frk.signal.SIGTERM, None)
+            return original(timeout)
+
+        child.communicate = communicate
+        with patch.object(frk.subprocess, "Popen", return_value=child), patch.object(frk.os, "killpg"):
+            with self.assertRaises(frk.ProcessCancelled):
+                frk.capture_fastlane(self.root, ["store_versions"], timeout=300)
+        self.assertTrue(child.finished)
+        self.assertEqual([frk.PROCESS_TERMINATION_GRACE_SECONDS], child.timeouts)
+
+    def test_launch_failure_restores_both_signal_handlers(self):
+        previous = {number: frk.signal.getsignal(number) for number in (frk.signal.SIGTERM, frk.signal.SIGINT)}
+        with patch.object(frk.subprocess, "Popen", side_effect=OSError("could not launch")):
+            with self.assertRaises(OSError):
+                frk.capture_fastlane(self.root, ["store_versions"], timeout=300)
+        for number, handler in previous.items():
+            self.assertEqual(handler, frk.signal.getsignal(number))
+
+    def test_process_group_is_signalled_even_after_its_leader_was_reaped(self):
+        child = FakeChild()
+        child.finished = True
+        with patch.object(frk.os, "killpg") as killpg:
+            frk.signal_process_group(child, frk.signal.SIGTERM)
+        killpg.assert_called_once_with(child.pid, frk.signal.SIGTERM)
+
+    def test_stream_cancellation_is_not_success_when_the_child_exits_zero(self):
+        started = self.spy_on_popen()
+        args = self.api_run_args("status")
+        command = [sys.executable, "-c", "print('ready', flush=True)"]
+        emit = frk.api_emit
+
+        def cancel_after_log(kind, **payload):
+            emit(kind, **payload)
+            if kind == "log":
+                self.assertEqual(0, started[0].wait(timeout=3))
+                frk.signal.getsignal(frk.signal.SIGTERM)(frk.signal.SIGTERM, None)
+
+        with patch.object(frk, "api_action_command", return_value=command), patch.object(frk, "api_emit", cancel_after_log):
+            self.assertEqual(143, frk.cmd_api_run(args))
+        events = [json.loads(line) for line in self.stdout.getvalue().splitlines()]
+        self.assertEqual(["started", "log", "finished"], [event["type"] for event in events])
+        self.assertFalse(events[-1]["success"])
+        self.assertEqual(143, events[-1]["exitCode"])
+
+    def cancellation_worker(self):
+        """A local fake Fastlane and helper; never runs a build or contacts a store."""
+        directory = self.root / "fake-tools"
+        directory.mkdir()
+        worker = directory / "fastlane"
+        worker.write_text("#!" + sys.executable + "\n" + r"""
+import os, signal, subprocess, sys, time
+from pathlib import Path
+leaf = "import os, signal, time\nfrom pathlib import Path\nif os.environ.get('FRK_TEST_RESIST') == '1':\n    signal.signal(signal.SIGTERM, signal.SIG_IGN)\nPath(os.environ['FRK_TEST_LEAF']).write_text(str(os.getpid()))\ntime.sleep(60)\n"
+if os.environ.get('FRK_TEST_RESIST') == '1':
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+subprocess.Popen([sys.executable, '-c', leaf])
+Path(os.environ['FRK_TEST_LEADER']).write_text(str(os.getpid()))
+print('fixture diagnostic, not a store report', flush=True)
+if os.environ.get('FRK_TEST_LEADER_EXITS') != '1':
+    time.sleep(60)
+""", encoding="utf-8")
+        worker.chmod(0o755)
+        leader, leaf = self.root / "leader.pid", self.root / "leaf.pid"
+        environment = {
+            **os.environ, "PATH": str(directory) + os.pathsep + os.environ.get("PATH", ""),
+            "FRK_TEST_LEADER": str(leader), "FRK_TEST_LEAF": str(leaf),
+        }
+
+        def cleanup():
+            # Kill only fixture processes that this test created, even on assertion failure.
+            for file in (leaf, leader):
+                if file.is_file():
+                    try:
+                        os.kill(int(file.read_text()), frk.signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+        self.addCleanup(cleanup)
+        return worker, environment, leader, leaf
+
+    def wait_for_fixture(self, process, *paths):
+        deadline = time.monotonic() + 10
+        while not all(path.is_file() and path.read_text() for path in paths):
+            self.assertIsNone(process.poll(), "fixture exited before becoming ready")
+            if time.monotonic() >= deadline:
+                self.fail("fixture did not become ready")
+            time.sleep(0.01)
+
+    def assert_fixture_stopped(self, path):
+        pid = int(path.read_text())
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
+                                   capture_output=True, text=True, timeout=3)
+            # An orphan can briefly be a zombie pending reaping by launchd/init.
+            if state.returncode != 0 or state.stdout.strip().startswith("Z"):
+                return
+            time.sleep(0.01)
+        self.fail("cancelled fixture process is still running")
+
+    def run_real_api_cancellation(self, *, streaming=False, signum=None, resist=False):
+        app = self.make_android_app("cancel-app")
+        frk.register_project(app)
+        _, environment, leader, leaf = self.cancellation_worker()
+        environment["FRK_TEST_RESIST"] = "1" if resist else "0"
+        args = (["api", "run", "build", str(app), "--platform", "android"] if streaming
+                else ["api", "store-versions", str(app)])
+        unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+        process = subprocess.Popen([sys.executable, str(FRK_PATH), *args], env=environment,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                   start_new_session=True)
+        try:
+            self.wait_for_fixture(process, leader, leaf)
+            process.send_signal(signum or frk.signal.SIGTERM)
+            output, error = process.communicate(timeout=12)
+            self.assertIsNone(unrelated.poll(), "cancellation reached an unrelated process")
+            self.assert_fixture_stopped(leader)
+            self.assert_fixture_stopped(leaf)
+            return process.returncode, output, error
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=3)
+            process.stdout.close()
+            process.stderr.close()
+            unrelated.kill()
+            unrelated.wait(timeout=3)
+
+    def test_real_store_cancellation_stops_a_stubborn_group_without_leaking_output(self):
+        code, output, error = self.run_real_api_cancellation(resist=True)
+        self.assertEqual(143, code, error)
+        document = json.loads(output)
+        self.assertEqual({"protocolVersion", "cliVersion", "error"}, set(document))
+        self.assertEqual("store_query_cancelled", document["error"]["code"])
+        self.assertNotIn("fixture diagnostic", output + error)
+
+    def test_real_store_ctrl_c_returns_a_cancelled_document(self):
+        code, output, error = self.run_real_api_cancellation(signum=frk.signal.SIGINT)
+        self.assertEqual(130, code, error)
+        self.assertEqual("store_query_cancelled", json.loads(output)["error"]["code"])
+
+    def test_real_stream_cancellation_stops_stubborn_helpers_and_finishes_once(self):
+        code, output, error = self.run_real_api_cancellation(streaming=True, resist=True)
+        self.assertEqual(143, code, error)
+        events = [json.loads(line) for line in output.splitlines()]
+        self.assertEqual("started", events[0]["type"])
+        self.assertEqual(1, sum(event["type"] == "finished" for event in events))
+        self.assertEqual("finished", events[-1]["type"])
+        self.assertFalse(events[-1]["success"])
+        self.assertEqual(code, events[-1]["exitCode"])
+
+    def test_timeout_stops_a_helper_after_its_original_parent_exits(self):
+        worker, environment, leader, leaf = self.cancellation_worker()
+        environment["FRK_TEST_RESIST"] = "1"
+        environment["FRK_TEST_LEADER_EXITS"] = "1"
+        with (patch.dict(os.environ, environment),
+              patch.object(frk, "fastlane_command", return_value=[str(worker)]),
+              patch.object(frk, "PROCESS_TERMINATION_GRACE_SECONDS", 0.1)):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                frk.capture_fastlane(self.root, ["store_versions"], timeout=1)
+        self.assert_fixture_stopped(leader)
+        self.assert_fixture_stopped(leaf)
 
     def test_the_document_command_list_matches_the_api_subcommands(self):
         # The class of bug this pins: a name a client can read out of the CLI
@@ -3730,7 +4110,11 @@ class FrkTestCase(unittest.TestCase):
                 else func.id if isinstance(func, ast.Name)
                 else None
             )
-            if name not in {"read_text", "write_text", "open"}:
+            # os.open returns a raw descriptor; there is no text decoding to pin.
+            if (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)
+                    and func.value.id == "os" and name == "open"):
+                continue
+            if name not in {"read_text", "write_text", "open", "fdopen"}:
                 continue
             if self.keyword_constant(call, "encoding") != "utf-8":
                 unpinned.append((name, call.lineno))

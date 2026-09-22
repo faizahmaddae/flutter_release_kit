@@ -125,7 +125,9 @@ struct FRKClient: FRKClientProtocol {
     func setBuildArgs(_ id: String, platform: PlatformKind, args: [String]) async throws -> BuildArgsResponse {
         var arguments = ["api", "set-build-args", id, "--platform", platform.rawValue]
         for arg in args {
-            arguments.append(contentsOf: ["--arg", arg])
+            // Flutter flags start with "--"; bind the value to --arg so argparse
+            // cannot mistake it for an option belonging to FRK itself.
+            arguments.append("--arg=\(arg)")
         }
         return try await runJSON(arguments: arguments)
     }
