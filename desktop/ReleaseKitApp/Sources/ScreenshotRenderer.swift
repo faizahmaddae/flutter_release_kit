@@ -61,7 +61,7 @@ struct ScreenshotRenderOptions: Equatable {
 
     /// Play forbids added backgrounds on Wear OS screenshots, so that padding is not the
     /// user's to set.
-    var resolvedPaddingPercent: CGFloat { target.allowsBackground ? paddingPercent : 0 }
+    var resolvedPaddingPercent: CGFloat { target.allowsBackground && paddingApplies ? paddingPercent : 0 }
 
     /// Without a frame there is no device to inset, so the bars a fitted capture leaves are
     /// purely the aspect mismatch - which is what the preflight messages quote in pixels.
@@ -176,16 +176,21 @@ enum ScreenshotRenderer {
     private static func rasterise(
         image: NSImage,
         options: ScreenshotRenderOptions,
-        chrome: ScreenshotPreviewChrome
+        chrome: ScreenshotPreviewChrome,
+        maxPixelDimension: CGFloat? = nil
     ) throws -> NSBitmapImageRep {
         guard let sourceSize = sourcePixelSize(image) else { throw ScreenshotRendererError.invalidSource }
         let plan = layout(source: sourceSize, options: options)
+        // Lay out in export pixels, then rasterise the same composition at display size.
+        // Export never passes a limit, so its dimensions and source quality stay intact.
+        let longestEdge = max(plan.canvas.width, plan.canvas.height)
+        let scale = min(1, max(1, maxPixelDimension ?? longestEdge) / longestEdge)
         // RGBA even when the export must not carry alpha: antialiased frame corners and the
         // drop shadow need a real alpha buffer mid-render. It is flattened before encoding.
         guard let bitmap = NSBitmapImageRep(
             bitmapDataPlanes: nil,
-            pixelsWide: Int(plan.canvas.width),
-            pixelsHigh: Int(plan.canvas.height),
+            pixelsWide: max(1, Int((plan.canvas.width * scale).rounded())),
+            pixelsHigh: max(1, Int((plan.canvas.height * scale).rounded())),
             bitsPerSample: 8,
             samplesPerPixel: 4,
             hasAlpha: true,
@@ -200,7 +205,11 @@ enum ScreenshotRenderer {
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = context
         context.imageInterpolation = .high
-        draw(image: image, source: sourceSize, plan: plan, options: options, chrome: chrome)
+        context.cgContext.scaleBy(
+            x: CGFloat(bitmap.pixelsWide) / plan.canvas.width,
+            y: CGFloat(bitmap.pixelsHigh) / plan.canvas.height
+        )
+        draw(image: image, source: sourceSize, plan: plan, options: options, chrome: chrome, shadowScale: scale)
         context.flushGraphics()
         NSGraphicsContext.restoreGraphicsState()
 
@@ -245,9 +254,10 @@ enum ScreenshotRenderer {
     static func renderedImage(
         image: NSImage,
         options: ScreenshotRenderOptions,
-        chrome: ScreenshotPreviewChrome = .none
+        chrome: ScreenshotPreviewChrome = .none,
+        maxPixelDimension: CGFloat? = nil
     ) throws -> NSImage {
-        let bitmap = try rasterise(image: image, options: options, chrome: chrome)
+        let bitmap = try rasterise(image: image, options: options, chrome: chrome, maxPixelDimension: maxPixelDimension)
         let result = NSImage(size: CGSize(width: bitmap.pixelsWide, height: bitmap.pixelsHigh))
         result.addRepresentation(bitmap)
         return result
@@ -628,7 +638,8 @@ enum ScreenshotRenderer {
         source: CGSize,
         plan: ScreenshotLayout,
         options: ScreenshotRenderOptions,
-        chrome: ScreenshotPreviewChrome
+        chrome: ScreenshotPreviewChrome,
+        shadowScale: CGFloat
     ) {
         let canvasStyle = options.resolvedCanvas
         let canvasRect = CGRect(origin: .zero, size: plan.canvas)
@@ -646,8 +657,10 @@ enum ScreenshotRenderer {
             )
             let shadow = NSShadow()
             shadow.shadowColor = .black.withAlphaComponent(0.32)
-            shadow.shadowBlurRadius = plan.boxRect.width * 0.018
-            shadow.shadowOffset = CGSize(width: 0, height: -plan.boxRect.width * 0.008)
+            // NSShadow uses bitmap pixels; the context transform scales paths but not
+            // its blur or offset. Apply the preview scale explicitly to match the export.
+            shadow.shadowBlurRadius = plan.boxRect.width * 0.018 * shadowScale
+            shadow.shadowOffset = CGSize(width: 0, height: -plan.boxRect.width * 0.008 * shadowScale)
             NSGraphicsContext.saveGraphicsState()
             shadow.set()
             metrics.shell.setFill()

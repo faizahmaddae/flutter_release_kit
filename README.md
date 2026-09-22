@@ -207,9 +207,12 @@ The optional SwiftUI app gives the same shared system a native project
 dashboard, guided onboarding, live logs, safe cancellation, build controls,
 Android testing-track uploads, and TestFlight uploads. Its Screenshot Studio
 captures a running Android emulator/device or iOS Simulator, accepts existing
-images and clipboard content, adds a clean Android or iPhone frame, and exports
-a new high-resolution PNG. Source images remain untouched and no screenshot is
-uploaded automatically. It calls the installed `frk` executable through a
+multiple images and clipboard content, adds device frames, and exports store-sized
+PNGs. A compact preset menu and image thumbnails keep editing accessible; optional
+batch sizes export in the background with progress and a stop control. Previews
+use a smaller display bitmap while PNG exports retain full resolution. Imported
+source files are protected from overwriting, and no screenshot is uploaded
+automatically. It calls the installed `frk` executable through a
 versioned JSON protocol, so release logic remains in one place and CLI
 improvements do not need to be duplicated in the app.
 

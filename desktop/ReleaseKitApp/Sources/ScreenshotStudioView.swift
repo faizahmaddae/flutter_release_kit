@@ -165,6 +165,8 @@ struct ScreenshotStudioView: View {
     @State private var shots: [StudioShot] = []
     @State private var selectedShotID: StudioShot.ID?
     @State private var previewImage: NSImage?
+    // Sources stay protected even after being removed from the queue.
+    @State private var importedSourceURLs: Set<URL> = []
 
     // Export target. The preset is global on purpose - it is the export's destination, not a
     // property of any one image - so it carries its own intent flag.
@@ -172,6 +174,7 @@ struct ScreenshotStudioView: View {
     @State private var sizeOverride: PixelSize?
     @State private var batchPresetIDs: Set<String> = []
     @State private var showsLegacyPresets = false
+    @State private var showsBatchPresets = false
 
     // Composition. The frame lives on the shot (see `StudioShot.frame`); `pendingFrame` is
     // only what the picker edits while the queue is empty, and what a new shot inherits when
@@ -188,6 +191,17 @@ struct ScreenshotStudioView: View {
     @State private var batchDirectory: URL?
     @State private var batchOutcomes: [StudioExportOutcome] = []
     @State private var isExportingBatch = false
+    @State private var isExportingPNG = false
+    @State private var exportTask: Task<Void, Never>?
+    @State private var batchTotal = 0
+    @State private var batchWasStopped = false
+
+    private var isExporting: Bool { isExportingBatch || isExportingPNG }
+
+    private struct PreviewInput: Equatable {
+        let shotID: UUID?
+        let options: ScreenshotRenderOptions
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -208,8 +222,8 @@ struct ScreenshotStudioView: View {
         // there is no path from a rendered preview to a changed frame. Both are needed:
         // selecting a shot whose frame happens to match the previous one leaves `options`
         // equal, and the preview still has to switch to the new image.
-        .onChange(of: options) { _, _ in refreshPreview() }
-        .onChange(of: selectedShotID) { _, _ in refreshPreview() }
+        .onChange(of: PreviewInput(shotID: selectedShotID, options: options)) { _, _ in refreshPreview() }
+        .onDisappear { exportTask?.cancel() }
         .alert("Screenshot Studio", isPresented: Binding(
             get: { errorMessage != nil },
             set: { if !$0 { errorMessage = nil } }
@@ -247,10 +261,11 @@ struct ScreenshotStudioView: View {
     private var controls: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                sourceCard
-                presetCard
-                compositionCard
-                preflightCard
+                sourceCard.disabled(isExporting)
+                presetCard.disabled(isExporting)
+                compositionCard.disabled(isExporting)
+                batchPresetCard.disabled(isExporting)
+                preflightCard.disabled(isExporting)
                 resultsCard
             }
             .padding(18)
@@ -263,7 +278,7 @@ struct ScreenshotStudioView: View {
     private var sourceCard: some View {
         SectionCard {
             VStack(alignment: .leading, spacing: 12) {
-                sectionTitle("1. Choose the screens", subtitle: "Capture a running device or import any PNG, JPEG, or HEIC image. Every image you add joins the batch queue.")
+                sectionTitle("1. Add screenshots", subtitle: "Capture a device, import PNG, JPEG or HEIC files, or paste an image.")
 
                 if isDiscovering {
                     HStack(spacing: 8) {
@@ -305,7 +320,7 @@ struct ScreenshotStudioView: View {
                         }
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(selectedTarget == nil || isCapturing)
+                    .disabled(selectedTarget == nil || isCapturing || isDiscovering)
                     .help("Take a PNG screenshot from the selected running device. The app and device are not modified.")
 
                     Button {
@@ -320,10 +335,10 @@ struct ScreenshotStudioView: View {
                 Divider()
 
                 HStack(spacing: 8) {
-                    Button("Import Image…") { importImage() }
-                        .help("Choose an existing PNG, JPEG, or HEIC file. The original file is never changed.")
+                    Button("Import Images…") { importImage() }
+                        .help("Choose one or more PNG, JPEG, or HEIC files. Originals are never changed.")
                     Button("Paste") { pasteImage() }
-                        .disabled(!pasteboardHasImage)
+                        .keyboardShortcut("v", modifiers: .command)
                         .help("Use the image currently copied to the macOS clipboard.")
                 }
 
@@ -332,7 +347,10 @@ struct ScreenshotStudioView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } else {
-                    queueList
+                    ScrollView {
+                        queueList
+                    }
+                    .frame(height: min(180, CGFloat(shots.count) * 64 + 22))
                 }
             }
         }
@@ -345,20 +363,27 @@ struct ScreenshotStudioView: View {
                 .foregroundStyle(.secondary)
             ForEach(Array(shots.enumerated()), id: \.element.id) { index, shot in
                 HStack(spacing: 8) {
-                    Image(systemName: shot.id == selectedShotID ? "largecircle.fill.circle" : "circle")
-                        .foregroundStyle(shot.id == selectedShotID ? Color.frkAccent : .secondary)
                     Button {
                         selectedShotID = shot.id
                     } label: {
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text("\(String(format: "%02d", index + 1)) · \(shot.label)")
-                                .font(.caption.weight(.medium))
-                                .lineLimit(1)
-                            Text(queueDetail(shot))
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
+                        HStack(spacing: 8) {
+                            Image(nsImage: shot.image)
+                                .resizable()
+                                .scaledToFit()
+                                .frame(width: 30, height: 44)
+                                .accessibilityHidden(true)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text("\(String(format: "%02d", index + 1)) · \(shot.label)")
+                                    .font(.caption.weight(.medium))
+                                    .lineLimit(1)
+                                Text(queueDetail(shot))
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
                         }
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(4)
+                        .background(shot.id == selectedShotID ? Color.frkAccent.opacity(0.10) : .clear, in: RoundedRectangle(cornerRadius: 6))
                     }
                     .buttonStyle(.plain)
                     Button {
@@ -368,6 +393,7 @@ struct ScreenshotStudioView: View {
                             .foregroundStyle(.tertiary)
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel("Remove \(shot.label)")
                     .help("Remove this image from the queue. The file it came from is untouched.")
                 }
                 .padding(.vertical, 3)
@@ -388,72 +414,104 @@ struct ScreenshotStudioView: View {
     private var presetCard: some View {
         SectionCard {
             VStack(alignment: .leading, spacing: 12) {
-                sectionTitle("2. Pick a store preset", subtitle: "The preset fixes the exported pixel size exactly. Tick rows to include them in a batch export.")
-
-                freePresetRow
-
-                ForEach(StorePresetCatalog.groups(includingLegacy: false)) { group in
-                    presetGroupView(group)
-                }
-
-                DisclosureGroup(isExpanded: $showsLegacyPresets) {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("Apple stopped requesting these in September 2024. They are never required.")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                        ForEach(StorePresetCatalog.legacy) { preset in
-                            presetRow(preset)
+                sectionTitle("2. Output size", subtitle: "Choose a store size, or Free to follow the source image.")
+                LabeledContent("Preset") {
+                    // Buttons also record a deliberate re-selection of the current preset.
+                    Menu {
+                        Button("Free — no preset") { select(preset: nil) }
+                        Divider()
+                        ForEach(StorePresetCatalog.groups(includingLegacy: false)) { group in
+                            Menu(group.title) {
+                                ForEach(group.presets) { preset in
+                                    presetMenuRow(preset)
+                                }
+                            }
                         }
+                        Menu("Legacy sizes") {
+                            ForEach(StorePresetCatalog.legacy) { preset in
+                                presetMenuRow(preset)
+                            }
+                        }
+                    } label: {
+                        Text(activePreset?.name ?? "Free — no preset")
                     }
-                    .padding(.top, 6)
-                } label: {
-                    Text("Legacy sizes")
-                        .font(.caption.weight(.semibold))
                 }
-
-                if let note = exportTarget.note {
-                    Label(note, systemImage: "info.circle")
+                if let preset = activePreset {
+                    if preset.alternates.isEmpty {
+                        Text("\(preset.pixelSize.description) · \(preset.requirement.label)")
+                            .font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        Picker("Size", selection: sizeBinding(preset)) {
+                            ForEach(preset.acceptedSizes, id: \.self) { size in
+                                Text(size.description).tag(size)
+                            }
+                        }
                         .font(.caption)
+                    }
+                }
+                if exportTarget.note != nil || activePreset?.followsPlayDimensionRules == true {
+                    DisclosureGroup("Size guidance") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            if let note = exportTarget.note {
+                                Text(note)
+                            }
+                            if activePreset?.followsPlayDimensionRules == true {
+                                Text(PlayImageRules.dimensionCaveat)
+                            }
+                        }
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+                        .padding(.top, 6)
+                    }
+                    .font(.caption)
                 }
-
-                if let preset = activePreset, preset.followsPlayDimensionRules {
-                    Text(PlayImageRules.dimensionCaveat)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                HStack(spacing: 8) {
-                    Button("Tick required") { batchPresetIDs = Set(StorePresetCatalog.mandatory.map(\.id)) }
-                        .help("Select every preset either store requires or conditionally requires.")
-                    Button("Clear ticks") { batchPresetIDs = [] }
-                        .disabled(batchPresetIDs.isEmpty)
-                }
-                .font(.caption)
             }
         }
     }
 
-    private var freePresetRow: some View {
-        HStack(spacing: 9) {
-            Image(systemName: presetChoice.value == nil ? "largecircle.fill.circle" : "circle")
-                .foregroundStyle(presetChoice.value == nil ? Color.frkAccent : .secondary)
-            Button {
-                select(preset: nil)
-            } label: {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Free — no preset")
-                        .font(.callout.weight(.medium))
-                    Text("Size follows the capture. Transparency allowed. Not a store size.")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
+    private func presetMenuRow(_ preset: StorePreset) -> some View {
+        Button {
+            select(preset: preset)
+        } label: {
+            if activePreset?.id == preset.id {
+                Label(preset.name, systemImage: "checkmark")
+            } else {
+                Text(preset.name)
             }
-            .buttonStyle(.plain)
+        }
+    }
+
+    private var batchPresetCard: some View {
+        SectionCard {
+            DisclosureGroup(isExpanded: $showsBatchPresets) {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Tick sizes to export every queued image in those sizes. Click a name to preview it.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    HStack {
+                        Button("Tick required") { batchPresetIDs = Set(StorePresetCatalog.mandatory.map(\.id)) }
+                            .help("Select every preset either store requires or conditionally requires.")
+                        Button("Clear ticks") { batchPresetIDs = [] }
+                            .disabled(batchPresetIDs.isEmpty)
+                    }
+                    .font(.caption)
+                    ForEach(StorePresetCatalog.groups(includingLegacy: false)) { group in
+                        presetGroupView(group)
+                    }
+                    DisclosureGroup("Legacy sizes", isExpanded: $showsLegacyPresets) {
+                        ForEach(StorePresetCatalog.legacy) { preset in
+                            presetRow(preset)
+                        }
+                    }
+                    .font(.caption)
+                }
+                .padding(.top, 10)
+            } label: {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Batch export sizes").font(.headline)
+                    Text(batchPresetIDs.isEmpty ? "Optional · export several sizes at once" : "\(batchPresetIDs.count) sizes selected · \(shots.count * batchPresetIDs.count) files")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
         }
     }
 
@@ -475,6 +533,7 @@ struct ScreenshotStudioView: View {
                 Toggle(isOn: batchBinding(preset)) { EmptyView() }
                     .labelsHidden()
                     .toggleStyle(.checkbox)
+                    .accessibilityLabel("Include \(preset.name) in batch")
                     .help("Include this preset in the batch export.")
                 Image(systemName: isActive ? "largecircle.fill.circle" : "circle")
                     .foregroundStyle(isActive ? Color.frkAccent : .secondary)
@@ -504,26 +563,6 @@ struct ScreenshotStudioView: View {
                 .buttonStyle(.plain)
             }
 
-            if isActive, !preset.alternates.isEmpty {
-                Picker("Size", selection: sizeBinding(preset)) {
-                    ForEach(preset.acceptedSizes, id: \.self) { size in
-                        Text(size == preset.pixelSize ? "\(size.description)  (default)" : size.description)
-                            .tag(size)
-                    }
-                }
-                .pickerStyle(.menu)
-                .font(.caption)
-                .padding(.leading, 30)
-                .help("Every size in this menu is equally accepted for this slot. The largest is the default.")
-            }
-
-            if isActive, let note = preset.note {
-                Text(note)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.leading, 30)
-            }
         }
     }
 
@@ -540,7 +579,7 @@ struct ScreenshotStudioView: View {
     private var compositionCard: some View {
         SectionCard {
             VStack(alignment: .leading, spacing: 13) {
-                sectionTitle("3. Frame and canvas", subtitle: "The frame belongs to the selected image, so a mixed queue keeps one frame per capture. Your choice is never overwritten by a capture, a preset or a device change.")
+                sectionTitle("3. Frame and canvas", subtitle: "Frame applies to the selected image. Canvas and spacing apply to all images.")
 
                 framePicker
                 canvasPicker
@@ -567,14 +606,14 @@ struct ScreenshotStudioView: View {
                     Text(frameMenuTitle(displayFrame))
                 }
                 .disabled(frameIsLocked)
-                .help("Applies to the selected image only. Re-choosing the current frame locks it against re-seeding.")
+                .help("Choose the device frame for the selected image.")
             }
 
             if shots.count > 1, !frameIsLocked {
                 Button("Apply \(displayFrame.title) to all \(shots.count) images") { applyFrameToAllShots() }
                     .font(.caption)
                     .controlSize(.small)
-                    .help("Explicitly sets every queued image to this frame and locks all of them against re-seeding. Nothing else in the app changes more than the selected image's frame.")
+                    .help("Apply this frame to every image in the queue.")
             }
 
             if let preset = activePreset, preset.isFrameLocked {
@@ -606,7 +645,7 @@ struct ScreenshotStudioView: View {
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             } else if activePreset != nil {
-                Text("Transparent is unavailable: App Store Connect and Google Play both reject images that carry an alpha channel, even when every pixel is opaque.")
+                Text("Store presets require an opaque background. Use Free for transparency.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -701,7 +740,7 @@ struct ScreenshotStudioView: View {
     private var preflightCard: some View {
         SectionCard {
             VStack(alignment: .leading, spacing: 10) {
-                sectionTitle("4. Preflight", subtitle: "Re-run on every change. Only alpha, Play's dimension bounds and the Wear OS rules can stop an export.")
+                sectionTitle("4. Export checks", subtitle: "Checks update as you edit. Warnings include a suggested fix.")
                 if let report {
                     if report.findings.isEmpty {
                         Label("No issues found for this combination.", systemImage: "checkmark.seal.fill")
@@ -801,11 +840,13 @@ struct ScreenshotStudioView: View {
     }
 
     private var batchSummary: String {
+        if isExportingBatch { return "Exporting · \(batchOutcomes.count) of \(batchTotal) files processed" }
+        let status = batchWasStopped ? "Batch stopped" : "Batch complete"
         let written = batchOutcomes.filter(\.succeeded).count
         let skipped = batchOutcomes.count - written
         return skipped == 0
-            ? "Batch complete · \(written) file\(written == 1 ? "" : "s") written"
-            : "Batch complete · \(written) written, \(skipped) skipped"
+            ? "\(status) · \(written) file\(written == 1 ? "" : "s") written"
+            : "\(status) · \(written) written, \(skipped) skipped"
     }
 
     // MARK: - Preview
@@ -834,7 +875,7 @@ struct ScreenshotStudioView: View {
             } description: {
                 Text("Run the app in an emulator or Simulator and choose Capture, or import an existing image.")
             } actions: {
-                Button("Import Image…") { importImage() }
+                Button("Import Images…") { importImage() }
                     .buttonStyle(.borderedProminent)
             }
         }
@@ -860,6 +901,15 @@ struct ScreenshotStudioView: View {
     private var footer: some View {
         HStack(spacing: 12) {
             Button("Close", role: .cancel) { dismiss() }
+                .disabled(isExporting)
+            if isExportingBatch {
+                Button(batchWasStopped ? "Stopping…" : "Stop batch") {
+                    batchWasStopped = true
+                    exportTask?.cancel()
+                }
+                .disabled(batchWasStopped)
+                .help("Finish the current file, then stop. Completed exports are kept.")
+            }
             VStack(alignment: .leading, spacing: 1) {
                 Text(outputLine)
                     .font(.caption.monospacedDigit())
@@ -875,23 +925,30 @@ struct ScreenshotStudioView: View {
                 exportBatch()
             } label: {
                 if isExportingBatch {
-                    ProgressView().controlSize(.small)
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("\(batchOutcomes.count)/\(batchTotal)").monospacedDigit()
+                    }
                 } else {
                     Label("Export Batch…", systemImage: "square.grid.2x2")
                 }
             }
-            .disabled(shots.isEmpty || batchPresetIDs.isEmpty || isExportingBatch)
+            .disabled(shots.isEmpty || batchPresetIDs.isEmpty || isExporting || isCapturing)
             .help(batchPresetIDs.isEmpty
-                ? "Tick one or more presets in step 2 to export a set in one action."
+                ? "Open Batch export sizes and tick one or more sizes."
                 : "Render every queued image into every ticked preset, into one folder you choose.")
 
             Button {
                 exportPNG()
             } label: {
-                Label("Export PNG…", systemImage: "square.and.arrow.down")
+                if isExportingPNG {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Label("Export PNG…", systemImage: "square.and.arrow.down")
+                }
             }
             .buttonStyle(.borderedProminent)
-            .disabled(selectedShot == nil || isBlocked || isExportingBatch)
+            .disabled(selectedShot == nil || isBlocked || isExporting || isCapturing)
             .help(report?.blockingReason ?? "Render a new PNG and save it where you choose. The source screenshot is never overwritten.")
         }
         .padding(18)
@@ -922,7 +979,7 @@ struct ScreenshotStudioView: View {
 
     private var captureButtonTitle: String {
         guard let target = selectedTarget else { return "Capture" }
-        return target.platform == .ios ? "Capture iPhone" : "Capture Android"
+        return "Capture \(target.platform.title)"
     }
 
     private var selectedShot: StudioShot? {
@@ -1031,10 +1088,6 @@ struct ScreenshotStudioView: View {
             : "Google Play forbids device frames, backgrounds and masking on Wear OS screenshots."
     }
 
-    private var pasteboardHasImage: Bool {
-        NSPasteboard.general.canReadObject(forClasses: [NSImage.self], options: nil)
-    }
-
     private var batchPresets: [StorePreset] {
         StorePresetCatalog.all.filter { batchPresetIDs.contains($0.id) }
     }
@@ -1090,7 +1143,6 @@ struct ScreenshotStudioView: View {
             // Nothing queued yet, so the choice is about the images to come.
             pendingFrame.choose(frame)
         }
-        refreshPreview()
     }
 
     /// The only way one image's frame reaches another. Explicit, labelled with the frame and
@@ -1101,7 +1153,6 @@ struct ScreenshotStudioView: View {
             shots[index].frame.choose(frame)
         }
         pendingFrame.choose(frame)
-        refreshPreview()
     }
 
     // MARK: - Preset selection
@@ -1166,7 +1217,7 @@ struct ScreenshotStudioView: View {
             // The capture's own temp file is the only file this view ever deletes, and it
             // deletes it after reading. Imported and pasted sources are never written to.
             defer { try? FileManager.default.removeItem(at: url) }
-            guard let image = NSImage(contentsOf: url) else { throw ScreenshotCaptureError.invalidImage }
+            guard let image = NSImage(data: try Data(contentsOf: url)) else { throw ScreenshotCaptureError.invalidImage }
             adopt(image: image, label: target.name, platform: target.platform)
         } catch {
             errorMessage = error.localizedDescription
@@ -1175,18 +1226,33 @@ struct ScreenshotStudioView: View {
 
     private func importImage() {
         let panel = NSOpenPanel()
-        panel.title = "Choose an app screenshot"
+        panel.title = "Choose app screenshots"
         panel.prompt = "Import"
         panel.allowedContentTypes = [.png, .jpeg, .heic]
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
-        panel.allowsMultipleSelection = false
-        guard panel.runModal() == .OK, let url = panel.url, let image = NSImage(contentsOf: url) else { return }
-        adopt(image: image, label: url.lastPathComponent, platform: nil)
+        panel.allowsMultipleSelection = true
+        guard panel.runModal() == .OK else { return }
+        var unreadable: [String] = []
+        for url in panel.urls {
+            // Retain the bytes so later changes to a file cannot change a queued image.
+            guard let data = try? Data(contentsOf: url), let image = NSImage(data: data) else {
+                unreadable.append(url.lastPathComponent)
+                continue
+            }
+            importedSourceURLs.insert(url)
+            adopt(image: image, label: url.lastPathComponent, platform: nil)
+        }
+        if !unreadable.isEmpty {
+            errorMessage = "Could not read these images: " + unreadable.joined(separator: ", ")
+        }
     }
 
     private func pasteImage() {
-        guard let image = NSImage(pasteboard: NSPasteboard.general) else { return }
+        guard let image = NSImage(pasteboard: NSPasteboard.general) else {
+            errorMessage = "No image is on the clipboard. Copy an image, then choose Paste again."
+            return
+        }
         adopt(image: image, label: "Clipboard", platform: nil)
     }
 
@@ -1199,7 +1265,6 @@ struct ScreenshotStudioView: View {
         exportedURL = nil
         batchOutcomes = []
         seedPreset(for: shot)
-        refreshPreview()
     }
 
     /// Runs once, on the shot being added, and never again. It writes only to the new shot,
@@ -1235,7 +1300,6 @@ struct ScreenshotStudioView: View {
             selectedShotID = shots.first?.id
         }
         batchOutcomes = []
-        refreshPreview()
     }
 
     private func refreshPreview() {
@@ -1247,7 +1311,8 @@ struct ScreenshotStudioView: View {
             previewImage = try ScreenshotRenderer.renderedImage(
                 image: shot.image,
                 options: options,
-                chrome: .safeAreaGuide
+                chrome: .safeAreaGuide,
+                maxPixelDimension: 1600
             )
         } catch {
             previewImage = nil
@@ -1352,44 +1417,54 @@ struct ScreenshotStudioView: View {
             .map { ScreenshotBatchNaming.filename(project: project.name, preset: $0, index: 1) }
             ?? ScreenshotBatchNaming.freeFilename(project: project.name, frame: options.resolvedFrame)
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        do {
-            try ScreenshotRenderer.pngData(image: shot.image, options: options).write(to: url, options: .atomic)
-            exportedURL = url
-            batchOutcomes = []
-        } catch {
-            errorMessage = error.localizedDescription
+        let job = ScreenshotExportJob(
+            image: shot.image, options: options, destination: url,
+            protectedSources: importedSourceURLs, blockingReason: report?.blockingReason
+        )
+        isExportingPNG = true
+        exportTask = Task { @MainActor in
+            let outcome = await Task.detached(priority: .userInitiated) {
+                autoreleasepool { job.write() }
+            }.value
+            isExportingPNG = false
+            if outcome.succeeded {
+                exportedURL = url
+                batchOutcomes = []
+            } else {
+                errorMessage = outcome.message
+            }
+            exportTask = nil
         }
     }
 
-    private struct BatchJob {
-        let shot: StudioShot
-        let preset: StorePreset
-        let filename: String
-        /// Set when the queue is deeper than the store allows for one size class.
-        let overLimit: String?
-    }
-
-    private func batchJobs() -> [BatchJob] {
-        batchPresets.flatMap { preset -> [BatchJob] in
+    private func batchJobs(into directory: URL) -> [ScreenshotExportJob] {
+        batchPresets.flatMap { preset in
             let limit = preset.store.maximumAssetsPerClass
             return shots.enumerated().map { offset, shot in
                 let index = offset + 1
-                return BatchJob(
-                    shot: shot,
-                    preset: preset,
-                    filename: ScreenshotBatchNaming.filename(project: project.name, preset: preset, index: index),
-                    overLimit: index > limit
-                        ? "\(preset.store.title) accepts at most \(limit) assets per size class per localization; this would be number \(index)."
-                        : nil
+                // Resolve all settings now, including variants and each shot's own frame.
+                let options = renderOptions(
+                    frame: shot.frame.value, target: .preset(preset),
+                    sizeOverride: preset.id == presetChoice.value ? sizeOverride : nil
+                )
+                let reason = index > limit
+                    ? "\(preset.store.title) accepts at most \(limit) assets per size class per localization; this would be number \(index)."
+                    : evaluate(shot: shot, options: options)?.blockingReason
+                let filename = ScreenshotBatchNaming.filename(project: project.name, preset: preset, index: index)
+                return ScreenshotExportJob(
+                    image: shot.image, options: options,
+                    destination: directory.appendingPathComponent(filename),
+                    protectedSources: importedSourceURLs, blockingReason: reason
                 )
             }
         }
     }
 
     private func exportBatch() {
-        guard !shots.isEmpty, !batchPresets.isEmpty else { return }
+        guard !shots.isEmpty, !batchPresets.isEmpty, !isExporting else { return }
         let panel = NSOpenPanel()
         panel.title = "Choose a folder for the batch"
+        panel.message = "Existing exports with matching names will be replaced. Imported source images are protected."
         panel.prompt = "Export Here"
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
@@ -1397,47 +1472,25 @@ struct ScreenshotStudioView: View {
         panel.canCreateDirectories = true
         guard panel.runModal() == .OK, let directory = panel.url else { return }
 
-        let jobs = batchJobs()
+        let jobs = batchJobs(into: directory)
         isExportingBatch = true
+        batchWasStopped = false
+        batchTotal = jobs.count
         batchDirectory = directory
         batchOutcomes = []
         exportedURL = nil
-        Task { @MainActor in
-            var outcomes: [StudioExportOutcome] = []
+        exportTask = Task { @MainActor in
             for job in jobs {
-                outcomes.append(run(job, into: directory))
-                batchOutcomes = outcomes
-                // Lets the results list paint between files instead of freezing the window
-                // for the length of the whole batch.
-                await Task.yield()
+                guard !Task.isCancelled else { break }
+                // Serial background rendering keeps the window responsive without retaining
+                // several full-resolution output bitmaps at once.
+                let outcome = await Task.detached(priority: .userInitiated) {
+                    autoreleasepool { job.write() }
+                }.value
+                batchOutcomes.append(outcome)
             }
             isExportingBatch = false
-        }
-    }
-
-    private func run(_ job: BatchJob, into directory: URL) -> StudioExportOutcome {
-        if let overLimit = job.overLimit {
-            return StudioExportOutcome(filename: job.filename, succeeded: false, message: overLimit)
-        }
-        // Built from scratch for this job rather than copied from the UI's options: the frame
-        // is the queued shot's own, and every preset-locked option re-derives from this
-        // preset instead of from whichever one happens to be active.
-        let options = renderOptions(
-            frame: job.shot.frame.value,
-            target: .preset(job.preset),
-            // The variant menu belongs to the preset it was chosen on; every other preset in
-            // the batch exports at its own default size.
-            sizeOverride: job.preset.id == presetChoice.value ? sizeOverride : nil
-        )
-        if let reason = evaluate(shot: job.shot, options: options)?.blockingReason {
-            return StudioExportOutcome(filename: job.filename, succeeded: false, message: reason)
-        }
-        do {
-            let data = try ScreenshotRenderer.pngData(image: job.shot.image, options: options)
-            try data.write(to: directory.appendingPathComponent(job.filename), options: .atomic)
-            return StudioExportOutcome(filename: job.filename, succeeded: true, message: nil)
-        } catch {
-            return StudioExportOutcome(filename: job.filename, succeeded: false, message: error.localizedDescription)
+            exportTask = nil
         }
     }
 

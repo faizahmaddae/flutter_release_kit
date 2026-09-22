@@ -1,4 +1,5 @@
 import AppKit
+import ImageIO
 import XCTest
 @testable import ReleaseKitApp
 
@@ -1756,11 +1757,157 @@ final class ReleaseKitAppTests: XCTestCase {
         )
     }
 
-    func testNoFrameAndNoPaddingPreserveSourcePixelDimensions() throws {
-        let source = testImage(width: 240, height: 480)
+    func testLimitedPreviewKeepsExportGeometryAndFullResolution() throws {
+        let source = testImage(width: 1080, height: 2400)
+        let options = ScreenshotRenderOptions(
+            target: .preset(StorePresetCatalog.defaultPreset), frame: .iphone, canvas: .light
+        )
+        let full = try ScreenshotRenderer.render(image: source, options: options)
+        let preview = try ScreenshotRenderer.renderedImage(image: source, options: options, maxPixelDimension: 800)
+        let small = try XCTUnwrap(preview.representations.first as? NSBitmapImageRep)
+        XCTAssertEqual(max(small.pixelsWide, small.pixelsHigh), 800)
+        XCTAssertLessThan(small.bytesPerRow * small.pixelsHigh, full.bytesPerRow * full.pixelsHigh / 8)
+
+        // Measure the neutral device shell independently of the layout implementation.
+        let largePixels = try XCTUnwrap(PixelGrid(rep: full))
+        let smallPixels = try XCTUnwrap(PixelGrid(rep: small))
+        func shell(_ grid: PixelGrid) throws -> PixelGrid.Box {
+            try XCTUnwrap(grid.boundingBox(in: .init(minX: 0, minY: 0, maxX: grid.width - 1, maxY: grid.height - 1)) {
+                $0.r < 170 && abs($0.r - $0.g) < 6 && abs($0.g - $0.b) < 6
+            })
+        }
+        let largeBox = try shell(largePixels)
+        let smallBox = try shell(smallPixels)
+        let scale = Double(small.pixelsHigh) / Double(full.pixelsHigh)
+        XCTAssertEqual(Double(smallBox.width), Double(largeBox.width) * scale, accuracy: 2)
+        XCTAssertEqual(Double(smallBox.height), Double(largeBox.height) * scale, accuracy: 2)
+        XCTAssertEqual(smallBox.midX, largeBox.midX * scale, accuracy: 2)
+        XCTAssertEqual(smallBox.midY, largeBox.midY * scale, accuracy: 2)
+        // Sample outside the shell: preview scaling must scale its shadow too.
+        for distance in [4, 8, 12] {
+            let x = Int(smallBox.midX)
+            let y = smallBox.maxY + distance
+            let reference = largePixels.pixel(Int(Double(x) / scale), Int(Double(y) / scale))
+            let actual = smallPixels.pixel(x, y)
+            XCTAssertEqual(actual.r, reference.r, accuracy: 6, "shadow at \(distance)px")
+        }
+        let png = try ScreenshotRenderer.pngData(image: source, options: options)
+        XCTAssertEqual(ScreenshotPreflight.pngPixelSize(png), StorePresetCatalog.defaultPreset.pixelSize)
+        XCTAssertEqual(ScreenshotRenderer.sourcePixelSize(source), CGSize(width: 1080, height: 2400))
+    }
+
+    func testLimitedPreviewHandlesLandscapeAndDoesNotEnlargeSmallImages() throws {
         let options = ScreenshotRenderOptions(frame: .none, canvas: .light, paddingPercent: 0)
+        for (width, height, expected) in [(1200, 600, CGSize(width: 400, height: 200)),
+                                           (100, 200, CGSize(width: 100, height: 200))] {
+            let source = testImage(width: width, height: height)
+            let preview = try ScreenshotRenderer.renderedImage(image: source, options: options, maxPixelDimension: 400)
+            XCTAssertEqual(ScreenshotRenderer.sourcePixelSize(preview), expected)
+            let grid = try XCTUnwrap(PixelGrid(rep: try XCTUnwrap(preview.representations.first as? NSBitmapImageRep)))
+            XCTAssertEqual(grid.pixel(4, 4), grid.pixel(grid.width - 5, grid.height - 5))
+            XCTAssertGreaterThan(grid.pixel(grid.width / 2, grid.height / 2).g, 60)
+        }
+    }
+
+    func testExportProtectsImportedSourcesIncludingSymlinkAndCaseAliases() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = directory.appendingPathComponent("Original.png")
+        let source = testImage(width: 64, height: 128)
+        let bytes = try XCTUnwrap(source.tiffRepresentation)
+        try bytes.write(to: sourceURL)
+        let link = directory.appendingPathComponent("alias.png")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: sourceURL)
+        let options = ScreenshotRenderOptions(frame: .iphone)
+        var destinations = [sourceURL, link]
+        let alternateCase = directory.appendingPathComponent("original.png")
+        if FileManager.default.fileExists(atPath: alternateCase.path) { destinations.append(alternateCase) }
+        for destination in destinations {
+            let outcome = ScreenshotExportJob(image: source, options: options, destination: destination, protectedSources: [sourceURL]).write()
+            XCTAssertFalse(outcome.succeeded)
+            XCTAssertTrue(outcome.message?.contains("source image") == true)
+            XCTAssertEqual(try Data(contentsOf: sourceURL), bytes)
+        }
+        let export = directory.appendingPathComponent("export.png")
+        XCTAssertTrue(ScreenshotExportJob(image: source, options: options, destination: export, protectedSources: [sourceURL]).write().succeeded)
+        XCTAssertEqual(try Data(contentsOf: sourceURL), bytes)
+        XCTAssertNotNil(ScreenshotPreflight.pngPixelSize(try Data(contentsOf: export)))
+    }
+
+    func testBackgroundExportPreservesRetinaPixelsAndImageOrientation() async throws {
+        let image = testImage(width: 120, height: 240)
+        let rep = try XCTUnwrap(image.representations.first as? NSBitmapImageRep)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = try XCTUnwrap(NSGraphicsContext(bitmapImageRep: rep))
+        NSColor.red.setFill()
+        CGRect(x: 0, y: 0, width: 60, height: 120).fill()
+        NSGraphicsContext.restoreGraphicsState()
+        image.size = CGSize(width: 60, height: 120)
+        let options = ScreenshotRenderOptions(frame: .iphone, canvas: .transparent)
+        let expected = try ScreenshotRenderer.pngData(image: image, options: options)
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".png")
+        defer { try? FileManager.default.removeItem(at: destination) }
+        let job = ScreenshotExportJob(image: image, options: options, destination: destination, protectedSources: [])
+        let outcome = await Task.detached { autoreleasepool { job.write() } }.value
+        XCTAssertTrue(outcome.succeeded, outcome.message ?? "")
+        XCTAssertEqual(try Data(contentsOf: destination), expected)
+    }
+
+    func testBackgroundExportMatchesImportedJPEGHEICAndPNG() async throws {
+        let original = testImage(width: 120, height: 240)
+        let bitmap = try XCTUnwrap(original.representations.first as? NSBitmapImageRep)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = try XCTUnwrap(NSGraphicsContext(bitmapImageRep: bitmap))
+        NSColor.red.setFill()
+        CGRect(x: 0, y: 0, width: 60, height: 120).fill()
+        NSGraphicsContext.restoreGraphicsState()
+        let cgImage = try XCTUnwrap(bitmap.cgImage)
+        let output = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".png")
+        defer { try? FileManager.default.removeItem(at: output) }
+        let options = ScreenshotRenderOptions(frame: .none, canvas: .light)
+        for format in ["public.jpeg", "public.heic", "public.png"] {
+            for orientation in [1, 3, 6, 8] {
+                let encoded = NSMutableData()
+                let writer = try XCTUnwrap(CGImageDestinationCreateWithData(encoded, format as CFString, 1, nil))
+                CGImageDestinationAddImage(writer, cgImage, [kCGImagePropertyOrientation: orientation] as CFDictionary)
+                XCTAssertTrue(CGImageDestinationFinalize(writer))
+                let imported = try XCTUnwrap(NSImage(data: encoded as Data))
+                let expected = try ScreenshotRenderer.pngData(image: imported, options: options)
+                let job = ScreenshotExportJob(image: imported, options: options, destination: output, protectedSources: [])
+                let outcome = await Task.detached { autoreleasepool { job.write() } }.value
+                XCTAssertTrue(outcome.succeeded, outcome.message ?? "")
+                XCTAssertEqual(try Data(contentsOf: output), expected, "\(format), orientation \(orientation)")
+            }
+        }
+    }
+
+    func testExportJobKeepsItsSettingsAndBlockedJobsLeaveExistingFilesAlone() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("export.png")
+        let image = testImage(width: 64, height: 128)
+        var liveOptions = ScreenshotRenderOptions(frame: .none, canvas: .light, paddingPercent: 0)
+        let job = ScreenshotExportJob(image: image, options: liveOptions, destination: destination, protectedSources: [])
+        liveOptions.frame = .iphone
+        liveOptions.target = .preset(StorePresetCatalog.defaultPreset)
+        XCTAssertTrue(job.write().succeeded)
+        let exported = try Data(contentsOf: destination)
+        XCTAssertEqual(ScreenshotPreflight.pngPixelSize(exported), PixelSize(64, 128))
+        var blockedJob = job
+        blockedJob.blockingReason = "Size class limit reached"
+        XCTAssertEqual(blockedJob.write().message, "Size class limit reached")
+        XCTAssertEqual(try Data(contentsOf: destination), exported)
+    }
+
+    func testNoFrameIgnoresPreviousSpacingAndPreservesSourcePixelDimensions() throws {
+        let source = testImage(width: 240, height: 480)
+        // Switching off a frame must also stop applying the disabled spacing control.
+        let options = ScreenshotRenderOptions(frame: .none, canvas: .light, paddingPercent: 14)
         let output = try XCTUnwrap(NSBitmapImageRep(data: ScreenshotRenderer.pngData(image: source, options: options)))
 
+        XCTAssertEqual(options.resolvedPaddingPercent, 0)
         XCTAssertEqual(output.pixelsWide, 240)
         XCTAssertEqual(output.pixelsHigh, 480)
     }
