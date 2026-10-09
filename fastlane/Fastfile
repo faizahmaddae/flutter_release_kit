@@ -505,10 +505,13 @@ platform :ios do
     # archiving and exporting agree, instead of leaving a user to discover the
     # mismatch by hand in Xcode. Debug and Profile are left untouched: this
     # tool never builds either for release, and a developer still needs an
-    # ordinary development identity to run and profile on a device.
+    # ordinary development identity to run and profile on a device. Only the
+    # Runner target: without `targets`, every target's Release is rewritten,
+    # and RunnerTests is given the app's bundle id and its App Store profile.
     update_code_signing_settings(
       path: abs("ios/Runner.xcodeproj"),
       use_automatic_signing: false,
+      targets: ["Runner"],
       team_id: ios_team_id,
       build_configurations: ["Release"],
       code_sign_identity: "Apple Distribution",
