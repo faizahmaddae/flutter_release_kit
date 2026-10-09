@@ -214,6 +214,17 @@ Play permissions are granted per app. A service account that can release one
 app does not automatically have access to another. Permission changes may take
 several minutes to propagate.
 
+A Play app that has never been published accepts only draft releases. Until its
+first release goes out from Play Console, set this in `fastlane/release_kit.yml`:
+
+```yaml
+android:
+  release_status: draft   # remove after the first release is rolled out
+```
+
+The upload then creates a draft on the testing track, and you roll it out in
+Play Console.
+
 ## 5. Configure iOS distribution signing
 
 Skip this section for Android-only apps.

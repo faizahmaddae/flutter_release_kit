@@ -365,6 +365,24 @@ class ReleaseKitFastfileTest < Minitest::Test
     assert_includes REGISTERED_LANES, "ios:upload_testflight"
   end
 
+  # --- android_release_status -------------------------------------------------
+
+  def test_android_release_status_defaults_to_completed
+    assert_equal "completed", android_helper("package_name" => "com.demo").android_release_status
+  end
+
+  def test_android_release_status_accepts_draft_for_a_new_app
+    assert_equal "draft", android_helper("release_status" => " draft\n").android_release_status
+  end
+
+  def test_android_release_status_rejects_anything_else
+    error = assert_raises(FastlaneUIError) { android_helper("release_status" => "inProgress").android_release_status }
+    assert_equal(
+      "#{CONFIG_PATH}: android.release_status must be one of completed, draft (got 'inProgress')",
+      error.message
+    )
+  end
+
   # --- android_track ----------------------------------------------------------
 
   def test_android_track_defaults_to_internal_when_key_absent

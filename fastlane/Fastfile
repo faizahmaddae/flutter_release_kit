@@ -234,7 +234,7 @@ platform :android do
       json_key: json_key,
       aab: aab,
       track: track,
-      release_status: "completed",
+      release_status: android_release_status,
       validate_only: dry_run,
       skip_upload_apk: true,
       skip_upload_metadata: true,
@@ -699,6 +699,18 @@ def android_track
   allowed = %w[internal alpha beta]
   UI.user_error!("#{CONFIG_PATH}: android.track must be one of #{allowed.join(', ')} (got '#{track}')") unless allowed.include?(track)
   track
+end
+
+# The status of the uploaded release. `completed` (the default) rolls it out to
+# the testing track. A Play app that has never been published accepts only
+# `draft` ("Only releases with status draft may be created on draft app"), so
+# a new app sets `android.release_status: draft` until its first release goes
+# out from Play Console, then removes the line.
+def android_release_status
+  status = (platform_config(:android)["release_status"] || "completed").to_s.strip
+  allowed = %w[completed draft]
+  UI.user_error!("#{CONFIG_PATH}: android.release_status must be one of #{allowed.join(', ')} (got '#{status}')") unless allowed.include?(status)
+  status
 end
 
 # Coerced explicitly rather than by Ruby truthiness. A bare Ruby `? :` gets this
